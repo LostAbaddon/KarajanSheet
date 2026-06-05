@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+*.whl
+venv/
+.venv/
+env/
+.env/
+*.manifest
+*.spec
+pip-wheel-metadata/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Virtual environments
+Python/
+env/
+ENV/
+
+# Audio output files
+*.wav
+
+# Test files
+test_*.py
+
+# Excluded data files
+sample.txt
+script.md

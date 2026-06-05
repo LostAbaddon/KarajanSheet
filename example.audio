@@ -1,0 +1,17 @@
+# ============================================
+# OmniVoice Audio Script - 示例脚本
+# ============================================
+
+@sample_rate 24000
+@base_volume 0.2
+@base_path .
+
+@segment intro
+    tts: "欢迎收听今天的节目，这是一个关于音频脚本引擎的演示"
+    voice: sample.wav
+    ref_text: "大家好，这里是胡聊瞎侃嘚啵嘚播客，我是主持人塔塔"
+    gap: -0.5s
+
+@segment narration
+    tts: "我是节目主持人，我叫塔塔，大家好，哇哈哈哈哈哈～～～～Aloha Kosmos!"
+
