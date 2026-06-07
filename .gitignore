@@ -32,6 +32,7 @@ ENV/
 
 # Audio output files
 *.wav
+*.pkf
 
 # Test files
 test_*.py
@@ -40,4 +41,3 @@ test_*.py
 docs/
 sample.txt
 script.md
-*.pkf
