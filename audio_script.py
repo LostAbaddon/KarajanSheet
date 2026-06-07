@@ -94,12 +94,15 @@ class TimeValue:
 
 @dataclass
 class VolCommand:
-    """一条音量控制指令。"""
+    """一条音量控制指令。支持 -> 渐变。"""
     start: TimeValue
-    end: Optional[TimeValue] = None  # None 表示到结尾
-    left_gain: Optional[float] = None   # L 声道增益倍数
-    right_gain: Optional[float] = None  # R 声道增益倍数
-    all_gain: Optional[float] = None    # A 双声道增益倍数
+    end: Optional[TimeValue] = None
+    left_gain: Optional[float] = None
+    right_gain: Optional[float] = None
+    all_gain: Optional[float] = None
+    to_left_gain: Optional[float] = None
+    to_right_gain: Optional[float] = None
+    to_all_gain: Optional[float] = None
 
 
 @dataclass
@@ -187,25 +190,27 @@ def parse_time(s: str) -> TimeValue:
 
 def parse_vol_spec(spec: str) -> tuple:
     """
-    解析音量规格，如 'L0.5', 'R1.2', 'A0.8', 'L0.5 R0.8'
-    返回 (left_gain, right_gain, all_gain)
+    解析音量规格。
+      静态:  'L0.5', 'R1.2', 'A0.8', 'L0.5 R0.8'
+      渐变:  'L0.0->1.0', 'R1.0->0.0 L0.0->1.0'
+    返回 (left_gain, right_gain, all_gain, to_left, to_right, to_all)
     """
     parts = spec.strip().split()
-    left_gain = None
-    right_gain = None
-    all_gain = None
+    left_gain = right_gain = all_gain = None
+    to_left = to_right = to_all = None
     for p in parts:
-        m = re.match(r"^([LRA])([\d.]+)$", p, re.IGNORECASE)
+        m = re.match(r"^([LRA])([\d.]+)(?:->([\d.]+))?$", p, re.IGNORECASE)
         if not m:
             raise ValueError(f"无法解析音量规格: '{p}'")
-        channel, val = m.group(1).upper(), float(m.group(2))
-        if channel == "L":
-            left_gain = val
-        elif channel == "R":
-            right_gain = val
-        elif channel == "A":
-            all_gain = val
-    return left_gain, right_gain, all_gain
+        ch, v1 = m.group(1).upper(), float(m.group(2))
+        v2 = float(m.group(3)) if m.group(3) else None
+        if ch == "L":
+            left_gain, to_left = v1, v2
+        elif ch == "R":
+            right_gain, to_right = v1, v2
+        elif ch == "A":
+            all_gain, to_all = v1, v2
+    return left_gain, right_gain, all_gain, to_left, to_right, to_all
 
 
 def parse_script(filepath: str) -> Script:
@@ -326,11 +331,13 @@ def parse_script(filepath: str) -> Script:
             spec_str = vol_match.group(3).strip()
             start = parse_time(start_str)
             end = parse_time(end_str) if end_str else None
-            left_gain, right_gain, all_gain = parse_vol_spec(spec_str)
+            left_gain, right_gain, all_gain, to_left, to_right, to_all = parse_vol_spec(spec_str)
             current_segment.vol_commands.append(
                 VolCommand(start=start, end=end,
                            left_gain=left_gain, right_gain=right_gain,
-                           all_gain=all_gain)
+                           all_gain=all_gain,
+                           to_left_gain=to_left, to_right_gain=to_right,
+                           to_all_gain=to_all)
             )
             return True
         # delay: (segment-level)
@@ -573,11 +580,15 @@ def apply_trim(data: np.ndarray, sr: int,
     start_sec = trim_start.to_seconds(total_sec)
     end_sec = trim_end.to_seconds(total_sec)
 
-    if start_sec >= end_sec:
-        raise ValueError(f"trim 起始时间({start_sec:.2f}s) >= 结束时间({end_sec:.2f}s)")
+    # 边界：区间无效时返回 1 帧占位（避免上游崩溃）
+    if end_sec <= start_sec:
+        end_sec = start_sec + 1.0 / sr
 
     start_frame = int(start_sec * sr)
     end_frame = int(end_sec * sr)
+    end_frame = min(end_frame, len(data))
+    if start_frame >= end_frame:
+        start_frame = end_frame - 1
     return data[start_frame:end_frame]
 
 
@@ -621,21 +632,32 @@ def apply_volume_commands(data: np.ndarray, sr: int,
         if start_frame >= end_frame:
             continue
 
-        # 应用增益：A 先设置全部，L/R 可覆盖特定声道
+        n_seg = end_frame - start_frame
+        ramp = np.linspace(0.0, 1.0, n_seg, dtype=np.float32)
+
+        def _lerp(a, b, r):
+            if b is None:
+                return np.full_like(r, a)
+            return a + (b - a) * r
+
+        seg_all = _lerp(cmd.all_gain, cmd.to_all_gain, ramp)
+        seg_left = _lerp(cmd.left_gain, cmd.to_left_gain, ramp)
+        seg_right = _lerp(cmd.right_gain, cmd.to_right_gain, ramp)
+
         if n_channels == 1:
             if cmd.all_gain is not None:
-                gain[start_frame:end_frame] = cmd.all_gain
+                gain[start_frame:end_frame] = seg_all
             if cmd.left_gain is not None:
-                gain[start_frame:end_frame] = cmd.left_gain
+                gain[start_frame:end_frame] = seg_left
             elif cmd.right_gain is not None:
-                gain[start_frame:end_frame] = cmd.right_gain
+                gain[start_frame:end_frame] = seg_right
         else:
             if cmd.all_gain is not None:
-                gain[start_frame:end_frame, :] = cmd.all_gain
+                gain[start_frame:end_frame, :] = seg_all[:, None]
             if cmd.left_gain is not None:
-                gain[start_frame:end_frame, 0] = cmd.left_gain
+                gain[start_frame:end_frame, 0] = seg_left
             if cmd.right_gain is not None and n_channels >= 2:
-                gain[start_frame:end_frame, 1] = cmd.right_gain
+                gain[start_frame:end_frame, 1] = seg_right
 
     # 应用增益
     if data.ndim == 1:
@@ -783,7 +805,6 @@ def _render_track(track: Track, sr: int, base_path: str,
         seg_durations.append(len(data) / sr)
 
     # 展开时间线（处理循环）
-    MAX_LOOP_ITER = 100
     timeline = []  # list of (seg_idx, data) 按播放顺序
 
     if has_loop:
@@ -792,19 +813,31 @@ def _render_track(track: Track, sr: int, base_path: str,
             timeline.append((i, seg_datas[i]))
         # 循环体
         loop_body = list(range(loop_start_idx, loop_end_idx + 1))
+        # 防御上限
+        SAFETY_MAX = 100000 if force_stop is not None else 100
+        # elapsed_sec = 循环体内部的累计时长（不包含前缀）
+        # 截断判定：循环体累计时长达到 force_stop 时立即停止
+        loop_elapsed = 0.0
         loop_count = 0
-        while loop_count < MAX_LOOP_ITER:
+        while loop_count < SAFETY_MAX:
+            loop_done = False
             for seg_idx in loop_body:
+                seg_dur = seg_durations[seg_idx]
+                # 如果这一段会跨越 force_stop，则只取到 force_stop 之前
+                if force_stop is not None and loop_elapsed + seg_dur > force_stop:
+                    # 这一段会被 force_stop 截断，但 timeline 仍要包含整段，
+                    # 后续 intervals 组装 + force_stop 切片会处理
+                    timeline.append((seg_idx, seg_datas[seg_idx]))
+                    loop_done = True
+                    break
                 timeline.append((seg_idx, seg_datas[seg_idx]))
-                # 检查是否超过 force_stop
-                if force_stop is not None:
-                    total_s = sum(seg_durations[idx] + 0 for idx, _ in timeline)  # approx
-                    if total_s >= force_stop:
-                        break
-            else:
-                loop_count += 1
-                continue
-            break
+                loop_elapsed += seg_dur
+                if force_stop is not None and loop_elapsed >= force_stop:
+                    loop_done = True
+                    break
+            if loop_done:
+                break
+            loop_count += 1
     else:
         for i in range(len(track.segments)):
             timeline.append((i, seg_datas[i]))
@@ -860,12 +893,18 @@ def _render_track(track: Track, sr: int, base_path: str,
         track_out[:, 0] *= left_gain
         track_out[:, 1] *= right_gain
 
-    # 应用 track 根级别的渐入/渐出（取所有 @on 中最长的 fade）
+    # fade_in / fade_out 语义：
+    # - fade_in: 本音轨开头 fade_in_sec 秒内从 0 线性增到原音量
+    # - fade_out: 截断点（包括自然结束和 force_stop）之前 fade_out_sec 秒内
+    #   从原音量线性降到 0；如果 force_stop 已设，按 force_stop 算窗口
     fade_in_s = max((rw.fade_in_sec for rw in track.relative_windows), default=0.0)
     fade_out_s = max((rw.fade_out_sec for rw in track.relative_windows), default=0.0)
 
+    # 决定本音轨实际"右边界"用于 fade_out
+    # 注意此时 force_stop 还未生效，需要参考传入的 force_stop
+    # 在调用 _render_track 时 force_stop 是参数
+
     if fade_in_s > 0 and len(track_out) > 0:
-        dur = len(track_out) / sr
         ramp_len = min(int(fade_in_s * sr), len(track_out))
         ramp = np.linspace(0, 1, ramp_len, dtype=np.float32)
         if n_channels >= 2:
@@ -875,13 +914,24 @@ def _render_track(track: Track, sr: int, base_path: str,
             track_out[:ramp_len] *= ramp
 
     if fade_out_s > 0 and len(track_out) > 0:
-        ramp_len = min(int(fade_out_s * sr), len(track_out))
-        ramp = np.linspace(1, 0, ramp_len, dtype=np.float32)
-        if n_channels >= 2:
-            track_out[-ramp_len:, 0] *= ramp
-            track_out[-ramp_len:, 1] *= ramp
+        # fade_out 窗口的右边界：
+        #   - 如果 force_stop 已给且 < 自然长度，窗口 = [force_stop - fade_out_s, force_stop]
+        #   - 否则 = 自然尾部 fade_out_s 秒
+        natural_end = len(track_out) / sr
+        if force_stop is not None and force_stop < natural_end:
+            fade_out_end_sec = force_stop
         else:
-            track_out[-ramp_len:] *= ramp
+            fade_out_end_sec = natural_end
+        fade_out_end_frame = int(fade_out_end_sec * sr)
+        fade_out_start_frame = max(0, fade_out_end_frame - int(fade_out_s * sr))
+        n = fade_out_end_frame - fade_out_start_frame
+        if n > 0:
+            ramp = np.linspace(1, 0, n, dtype=np.float32)
+            if n_channels >= 2:
+                track_out[fade_out_start_frame:fade_out_end_frame, 0] *= ramp
+                track_out[fade_out_start_frame:fade_out_end_frame, 1] *= ramp
+            else:
+                track_out[fade_out_start_frame:fade_out_end_frame] *= ramp
 
     # 截断
     if force_stop is not None:
@@ -932,69 +982,145 @@ def execute_script(script: Script, output_path: str,
     if len(sorted_order) != len(script.tracks):
         raise ValueError("音轨间存在循环依赖，无法继续")
 
-    # ---- 渲染每个 track ----
-    rendered = {}       # name -> np.ndarray
-    track_durations = {} # name -> float (seconds), natural end of track audio
-    track_end_times = {} # name -> float (seconds), absolute end on master timeline (for @on)
+    # ============================================================
+    # 阶段 1：纯计算阶段
+    # 不实际加载音频，只计算：
+    #   - 每个 segment 的预估时长（trim 区间大小 / tts 一律估 5s 占位 / file 用 ffprobe 读时长）
+    #   - 每个 track 的自然时长（loop 展开后）
+    #   - 每个 track 在 master 上的起点
+    #   - 每个 track 的 force_stop（end_relative → 本音轨时间线）
+    # ============================================================
+    print("=== 阶段 1：时间规划 ===")
+    track_starts = {}      # name -> seconds (master 上起点)
+    track_durations = {}   # name -> seconds (本音轨自然时长)
+    track_end_times = {}   # name -> seconds (master 上结束点)
+    track_force_stops = {} # name -> seconds or None
+
+    # 工具：从文件头读时长（不加载整个文件）
+    def _probe_file_seconds(path: str) -> float:
+        if not os.path.isabs(path):
+            path = os.path.join(base_path, path)
+        try:
+            info = sf.info(path)
+            return float(info.frames) / float(info.samplerate)
+        except Exception:
+            try:
+                # fallback: ffmpeg/ffprobe
+                r = subprocess.run(
+                    ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                     "-of", "default=noprint_wrappers=1:nokey=1", path],
+                    capture_output=True, text=True
+                )
+                return float(r.stdout.strip())
+            except Exception:
+                return 5.0  # 兜底
+
+    def _seg_estimate_seconds(seg) -> float:
+        """估算单个 segment 的时长（不加载实际音频数据）"""
+        # tts 暂时用固定预估（5 秒占位）；后续会按比例缩放
+        if seg.tts_text is not None and seg.file_path is None:
+            base = 5.0  # 占位
+        else:
+            if seg.file_path is None:
+                base = 1.0
+            else:
+                base = _probe_file_seconds(seg.file_path)
+        # trim 影响
+        if seg.trim_start is not None and seg.trim_end is not None:
+            total = base
+            s = seg.trim_start.to_seconds(total)
+            e = seg.trim_end.to_seconds(total)
+            base = max(0.001, e - s)
+        return base
+
+    # 第一遍：算每个 track 的自然时长（loop 展开后，截断到 force_stop）
+    for tname in sorted_order:
+        t = track_map[tname]
+        # 在没有 force_stop 的前提下，先按"无限循环"算一个保守上限；
+        # force_stop 信息等会按 @on 依赖关系迭代收敛
+        # 第一次：假设没有 force_stop
+        if t.loop_start is not None and t.loop_end is not None:
+            body_idx = [i for i, sg in enumerate(t.segments)
+                        if t.loop_start <= sg.name and sg.name <= t.loop_end]
+            # 简化：直接用 loop_start/loop_end 名称找索引
+            ls = le = -1
+            for i, sg in enumerate(t.segments):
+                if sg.name == t.loop_start: ls = i
+                if sg.name == t.loop_end: le = i
+            loop_body = list(range(ls, le + 1)) if ls >= 0 and le >= 0 else []
+            prefix = list(range(0, ls)) if ls >= 0 else []
+            body_dur = sum(_seg_estimate_seconds(t.segments[i]) for i in loop_body)
+            prefix_dur = sum(_seg_estimate_seconds(t.segments[i]) for i in prefix)
+            # 没有 force_stop 时自然长度 = 前缀 + N*body, N = SAFETY(100)
+            SAFETY = 100
+            nat_dur = prefix_dur + body_dur * SAFETY
+        else:
+            nat_dur = sum(_seg_estimate_seconds(sg) for sg in t.segments)
+        track_durations[tname] = nat_dur
+        print(f"  [预] {tname} 自然时长 ≈ {nat_dur:.2f}s")
+
+    # 迭代收敛 force_stop（最多 5 轮，足够处理链式依赖）
+    for _round in range(5):
+        # 算每个 track 的 master 起点（依赖其他 track 的 master 起点 + 时长）
+        for tname in sorted_order:
+            t = track_map[tname]
+            base = t.delay or 0.0
+            for rw in t.relative_windows:
+                if rw.target_track not in track_end_times:
+                    continue
+                if rw.after_start is not None:
+                    base += rw.after_start
+                break
+            track_starts[tname] = base
+            track_end_times[tname] = base + track_durations[tname]
+
+        # 算每个 track 的 force_stop
+        changed = False
+        for tname in sorted_order:
+            t = track_map[tname]
+            start = track_starts[tname]
+            fs = None
+            for rw in t.relative_windows:
+                if rw.end_relative is not None and rw.target_track in track_end_times:
+                    abs_cut = track_end_times[rw.target_track] + rw.end_relative
+                    local = max(0.0, abs_cut - start)
+                    if fs is None or local < fs:
+                        fs = local
+            old_dur = track_durations[tname]
+            if fs is not None and fs < old_dur:
+                track_durations[tname] = fs
+                changed = True
+        if not changed:
+            break
+
+    # 重新算 master 终点
+    for tname in sorted_order:
+        track_end_times[tname] = track_starts[tname] + track_durations[tname]
+        track_force_stops[tname] = track_durations[tname]
+        if tname in track_force_stops and track_durations[tname] > 0:
+            print(f"  [终] {tname}: 起点 {track_starts[tname]:.2f}s, 结束 {track_end_times[tname]:.2f}s")
+
+    print("=== 阶段 2：实际渲染 ===")
+    rendered = {}
 
     for tname in sorted_order:
         t = track_map[tname]
         print(f"[Track] {tname} ({len(t.segments)} segments)")
-
-        # 确定强制停止时间：所有 @on 的 end_relative 中取最早的
-        force_stop = None
-        for rw in t.relative_windows:
-            if rw.end_relative is not None and rw.target_track in track_end_times:
-                target_end = track_end_times[rw.target_track]
-                cand = max(0.0, target_end + rw.end_relative)
-                if force_stop is None or cand < force_stop:
-                    force_stop = cand
+        force_stop = track_force_stops[tname]
         if force_stop is not None:
-            print(f"  @on end_relative → 最早截断于 {force_stop:.2f}s")
-
-        # 渲染
+            print(f"  force_stop: {force_stop:.2f}s")
         track_data = _render_track(
             t, sr, base_path,
             script.base_volume, force_stop
         )
-
-        nat_dur = len(track_data) / sr
         rendered[tname] = track_data
-        track_durations[tname] = nat_dur
-        print(f"  自然时长: {nat_dur:.2f} 秒")
+        print(f"  实际时长: {len(track_data) / sr:.2f} 秒")
 
-    # ---- 计算各 track 在 master 上的绝对位置 ----
-    track_positions = {}  # name -> frame offset (int)
-    max_end_frame = 0
-
+    # ---- 计算各 track 在 master 上的绝对位置（阶段 1 已算） ----
+    track_positions = {n: int(v * sr) for n, v in track_starts.items()}
+    max_end_frame = max(int(v * sr) for v in track_end_times.values())
     for tname in sorted_order:
-        t = track_map[tname]
-        # 基础位置：整轨 delay
-        base_frame = int(t.delay * sr)
-
-        # @on: 多个 @on 共存时，取首个给出起始约束的 @on
-        # （after_start 优先级 > after_end）
-        for rw in t.relative_windows:
-            if rw.target_track not in track_end_times:
-                continue
-            target_start = track_positions.get(rw.target_track, 0)
-            target_dur_frames = int(track_durations.get(rw.target_track, 0) * sr)
-            target_end_frame = target_start + target_dur_frames
-            if rw.after_start is not None:
-                base_frame = target_start + int(rw.after_start * sr)
-            else:
-                base_frame = target_end_frame + int(rw.after_end * sr)
-            break  # 只用第一个给出起始约束的 @on
-
-        if base_frame < 0:
-            base_frame = 0
-
-        track_positions[tname] = base_frame
-        track_end_times[tname] = base_frame / sr + track_durations[tname]
-        end_frame = base_frame + int(track_durations[tname] * sr)
-        if end_frame > max_end_frame:
-            max_end_frame = end_frame
-        print(f"  master 位置: {base_frame / sr:.2f}s → {end_frame / sr:.2f}s")
+        print(f"  master 位置: {track_starts[tname]:.2f}s → {track_end_times[tname]:.2f}s")
 
     # ---- 混合到 master ----
     max_channels = 1

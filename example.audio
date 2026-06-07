@@ -26,7 +26,7 @@
 #   - pan -0.4  → 偏左 40%
 #   - 两个 @on：
 #       @on voiceover  after_start: 0s     → 与主播同时开始
-#       @on voiceover  end_relative: -0.2s → 早于主播 0.2 秒截断
+#       @on voiceover  end_relative: 10.2s → 主播结束后 10.2 秒截断
 #       @on voiceover  fade_out: 1s        → 截断前最后 1 秒线性渐出至静音
 #   - @loop bgm_a bgm_b → 循环直到被 end_relative 截断
 # ============================================================
@@ -39,7 +39,7 @@
         after_start: 0s
     @on voiceover
         end_relative: 10.2s
-        fade_out: 1s
+        fade_out: 5s
 
     @loop bgm_a bgm_b
 
