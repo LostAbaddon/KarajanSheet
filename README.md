@@ -1,0 +1,2 @@
+# KarajanSheet
+一个根据Karajan脚本来编排音轨与声音并能实现声音响度和声道渐变等效果的自动化音频生成工具，更能通过OmniVoice来实现TTS后自动编排。
