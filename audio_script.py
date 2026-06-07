@@ -1,20 +1,36 @@
 #!/usr/bin/env python3
 """
-Audio Script Engine - 自定义音频脚本语言解析与执行器
+Audio Script Engine - 自定义音频脚本语言解析与执行器 v1.1
 
 脚本语法概览:
     @sample_rate 24000          # 输出采样率（可选，默认 24000）
     @base_volume 0.15           # 全局响度基准线（RMS 目标值，可选）
     @base_path ./sounds/        # 相对路径的基路径（可选）
+    @peak_limit -1.0            # 总线峰值上限（dBFS，默认 0，可选）
+    @track <name>               # 定义一个音轨
+        volume: <gain>          # 整轨音量增益倍数（可选，默认 1.0）
+        pan: <-1..+1>          # 整轨左右声道（可选，默认 0）
+        delay: <time>           # 整轨延迟秒数（可选，默认 0s）
 
-    @segment <name>             # 定义一个音频片段
-        file: <path>            # 音频文件（支持 mp3/wav/m4a/flac 等）
-        tts: "<text>"           # TTS 合成文本（与 file 二选一）
-        voice: <path>           # TTS 音色参考音频（配合 tts 使用）
-        ref_text: "<text>"      # TTS 参考文本（配合 tts 使用）
-        trim: <start> <end>     # 截取时间区间
-        vol: <range> <spec>     # 音量控制（可多条）
-        gap: <time>             # 与下一段的间隔（正=静音，负=重叠）
+        @on <other_track>       # 相对目标音轨的时间控制（可写多块）
+            after_start: <time> # 目标音轨开始后多少秒本音轨启动（设了就用它）
+            after_end: <time>   # 目标音轨结束后多少秒本音轨才启动
+            end_relative: <time># 本音轨结束点相对目标音轨结束的位移
+            fade_in: <time>       # 本音轨首 N 秒做线性渐入（可选）
+            fade_out: <time>      # 本音轨尾 N 秒做线性渐出（可选）
+        # 多个 @on 可同时存在：首个给出起始约束的 @on 决定开始时间，
+        # 所有给出 end_relative 的 @on 中取最早的时间点作为截断。
+
+        @loop <start> <end>     # 循环区间（段名，闭区间，可选）
+
+        @segment <name>         # 定义一个音频片段
+            file: <path>        # 音频文件（支持 mp3/wav/m4a/flac 等）
+            tts: "<text>"       # TTS 合成文本（与 file 二选一）
+            voice: <path>       # TTS 音色参考音频（配合 tts 使用）
+            ref_text: "<text>"  # TTS 参考文本（配合 tts 使用）
+            trim: <start> <end> # 截取时间区间
+            vol: <range> <spec> # 音量控制（可多条）
+            delay: <time>       # 段前延迟（正=静音，负=与上一段重叠）
 
 时间格式: Ns(秒) | N%(百分比) | -Ns(倒数秒) | -N%(倒数百分比)
 vol spec:  R0.8(右声道80%) | L1.2(左声道120%) | A1.3(全部130%)
@@ -97,8 +113,44 @@ class Segment:
     trim_start: Optional[TimeValue] = None
     trim_end: Optional[TimeValue] = None
     vol_commands: list = field(default_factory=list)  # list[VolCommand]
-    gap: Optional[float] = None           # 与下一段的间隔秒数（可为负）
+    delay: Optional[float] = None          # 段前延迟（正=静音，负=与前段重叠）
 
+
+@dataclass
+class RelativeWindow:
+    """音轨间相对时间控制。
+
+    三个字段独立设置：
+      - after_start:  本音轨开始点相对目标音轨开始点的位移
+      - after_end:    本音轨开始点相对目标音轨结束点的位移
+      - end_relative: 本音轨结束点相对目标音轨结束点的位移
+
+    优先级：after_start 设置了就用 after_start（after_end 被忽略）。
+
+    多个 @on 块可以共存：每个块都声明它锁定的 target_track。
+    执行时：第一个给出起始约束（after_start/after_end）的 @on 决定开始时间；
+           所有给出 end_relative 的 @on 中取最早时间点作为强制截断。
+
+    fade_in_sec / fade_out_sec：在音轨播放的首/尾 N 秒做线性渐入/渐出。
+    """
+    target_track: str
+    after_start: Optional[float] = None
+    after_end: float = 0.0
+    end_relative: Optional[float] = None
+    fade_in_sec: float = 0.0          # 首 N 秒做渐入（0 = 不渐入）
+    fade_out_sec: float = 0.0         # 尾 N 秒做渐出（0 = 不渐出）
+
+@dataclass
+class Track:
+    """一条音轨。"""
+    name: str
+    volume: float = 1.0                     # 整轨音量增益倍数
+    pan: float = 0.0                        # -1=全左, 0=居中, 1=全右
+    delay: float = 0.0                      # 整轨延迟秒数
+    relative_windows: list = field(default_factory=list)  # list[RelativeWindow]
+    loop_start: Optional[str] = None        # 循环起始 segment 名
+    loop_end: Optional[str] = None          # 循环结束 segment 名
+    segments: list = field(default_factory=list)  # list[Segment]
 
 @dataclass
 class Script:
@@ -106,7 +158,8 @@ class Script:
     sample_rate: int = 24000
     base_volume: Optional[float] = None   # RMS 目标值
     base_path: str = "."
-    segments: list = field(default_factory=list)  # list[Segment]
+    peak_limit_db: float = 0.0              # @peak_limit（默认 0 dBFS）
+    tracks: list = field(default_factory=list)   # list[Track]
 
 
 # ============================================================
@@ -164,23 +217,184 @@ def parse_script(filepath: str) -> Script:
         lines = f.readlines()
 
     script = Script()
+    current_track: Optional[Track] = None
     current_segment: Optional[Segment] = None
+    current_relative: Optional[RelativeWindow] = None  # 正在解析的 @on
+
+    # 追踪缩进上下文：track 下的字段/@on 比 segment 缩进多一级；segment 内字段再缩进一级
+    # 简化策略：用"当前所在的缩进级"区分 track-level / segment-level
+    # track-level: @track 后的行无 @ 前缀且匹配 volume/pan/delay: 
+    # segment-level: @segment 后的行匹配 file/tts/voice/ref_text/trim/vol/delay:
+
+    def _flush_segment():
+        nonlocal current_segment, current_track
+        if current_track is not None and current_segment is not None:
+            current_track.segments.append(current_segment)
+            current_segment = None
+
+    def _parse_track_field(line: str, lineno: int):
+        nonlocal current_track, current_relative
+        # track-level 字段
+        vol_match = re.match(r"^volume:\s*([\d.]+)$", line, re.IGNORECASE)
+        if vol_match:
+            current_track.volume = float(vol_match.group(1))
+            return True
+        pan_match = re.match(r"^pan:\s*([-]?[\d.]+)$", line, re.IGNORECASE)
+        if pan_match:
+            current_track.pan = float(pan_match.group(1))
+            return True
+        tk_delay = re.match(r"^delay:\s*(-?[\d.]+)(s|ms)?$", line, re.IGNORECASE)
+        if tk_delay:
+            v = float(tk_delay.group(1))
+            u = (tk_delay.group(2) or "s").lower()
+            current_track.delay = v if u == "s" else v / 1000.0
+            return True
+        return False
+
+    def _parse_on_field(line: str, lineno: int):
+        nonlocal current_relative
+        if current_relative is None:
+            return False
+        as_match = re.match(r"^after_start:\s*(-?[\d.]+)(s|ms)?$", line, re.IGNORECASE)
+        if as_match:
+            v = float(as_match.group(1))
+            u = (as_match.group(2) or "s").lower()
+            current_relative.after_start = v if u == "s" else v / 1000.0
+            return True
+        ae_match = re.match(r"^after_end:\s*(-?[\d.]+)(s|ms)?$", line, re.IGNORECASE)
+        if ae_match:
+            v = float(ae_match.group(1))
+            u = (ae_match.group(2) or "s").lower()
+            current_relative.after_end = v if u == "s" else v / 1000.0
+            return True
+        er_match = re.match(r"^end_relative:\s*(-?[\d.]+)(s|ms)?$", line, re.IGNORECASE)
+        if er_match:
+            v = float(er_match.group(1))
+            u = (er_match.group(2) or "s").lower()
+            current_relative.end_relative = v if u == "s" else v / 1000.0
+            return True
+        fi_match = re.match(r"^fade_in\s*:\s*(-?[\d.]+)(s|ms)?$", line, re.IGNORECASE)
+        if fi_match:
+            v = float(fi_match.group(1))
+            u = (fi_match.group(2) or "s").lower()
+            current_relative.fade_in_sec = v if u == "s" else v / 1000.0
+            return True
+        fo_match = re.match(r"^fade_out\s*:\s*(-?[\d.]+)(s|ms)?$", line, re.IGNORECASE)
+        if fo_match:
+            v = float(fo_match.group(1))
+            u = (fo_match.group(2) or "s").lower()
+            current_relative.fade_out_sec = v if u == "s" else v / 1000.0
+            return True
+        return False
+
+    def _parse_segment_field(line: str, lineno: int):
+        nonlocal current_segment
+        # file: (reuse existing regex)
+        file_match = re.match(r"^file:\s+(.+)$", line, re.IGNORECASE)
+        if file_match:
+            current_segment.file_path = file_match.group(1).strip()
+            return True
+        # tts:
+        tts_match = re.match(r'^tts:\s+"(.+)"$', line, re.IGNORECASE)
+        if tts_match:
+            current_segment.tts_text = tts_match.group(1)
+            return True
+        # voice:
+        voice_match = re.match(r"^voice:\s+(.+)$", line, re.IGNORECASE)
+        if voice_match:
+            current_segment.tts_voice = voice_match.group(1).strip()
+            return True
+        # ref_text:
+        rt_match = re.match(r'^ref_text:\s+"(.+)"$', line, re.IGNORECASE)
+        if rt_match:
+            current_segment.tts_ref_text = rt_match.group(1)
+            return True
+        # trim:
+        trim_match = re.match(r"^trim:\s+(.+?)\s+(.+)$", line, re.IGNORECASE)
+        if trim_match:
+            current_segment.trim_start = parse_time(trim_match.group(1))
+            current_segment.trim_end = parse_time(trim_match.group(2))
+            return True
+        # vol:
+        vol_match = re.match(
+            r"^vol:\s+(-?[\d.]+[s%]?)\s*-\s*(-?[\d.]+[s%]?)?\s+(.+)$",
+            line, re.IGNORECASE
+        )
+        if vol_match:
+            start_str = vol_match.group(1)
+            end_str = vol_match.group(2)
+            spec_str = vol_match.group(3).strip()
+            start = parse_time(start_str)
+            end = parse_time(end_str) if end_str else None
+            left_gain, right_gain, all_gain = parse_vol_spec(spec_str)
+            current_segment.vol_commands.append(
+                VolCommand(start=start, end=end,
+                           left_gain=left_gain, right_gain=right_gain,
+                           all_gain=all_gain)
+            )
+            return True
+        # delay: (segment-level)
+        delay_match = re.match(r"^delay:\s*(-?[\d.]+)(s|ms)?$", line, re.IGNORECASE)
+        if delay_match:
+            v = float(delay_match.group(1))
+            u = (delay_match.group(2) or "s").lower()
+            current_segment.delay = v if u == "s" else v / 1000.0
+            return True
+        # gap: 废弃
+        if re.match(r"^gap\s*:", line, re.IGNORECASE):
+            raise SyntaxError(
+                f"第 {lineno} 行: 'gap' 字段已废弃，请改用 'delay'"
+                "(语义：相对上一段结束点的位移量，正=延后，负=提前/重叠)"
+            )
+        return False
 
     for lineno, raw_line in enumerate(lines, 1):
         line = raw_line.strip()
-
         # 跳过空行和注释
         if not line or line.startswith("#"):
             continue
 
-        # 全局指令
+        # 全局指令（以 @ 开头）
         if line.startswith("@"):
-            # @segment 指令 —— 结束上一个 segment，开始新的
+            # @segment 指令
             seg_match = re.match(r"^@segment\s+(.+)$", line, re.IGNORECASE)
             if seg_match:
-                if current_segment is not None:
-                    script.segments.append(current_segment)
+                _flush_segment()
+                if current_track is None:
+                    raise SyntaxError(f"第 {lineno} 行: @segment 必须出现在 @track 内")
                 current_segment = Segment(name=seg_match.group(1).strip())
+                current_relative = None  # @on 不是 segment 的一部分
+                continue
+
+            # @track 指令
+            track_match = re.match(r"^@track\s+(.+)$", line, re.IGNORECASE)
+            if track_match:
+                _flush_segment()
+                current_relative = None
+                current_track = Track(name=track_match.group(1).strip())
+                script.tracks.append(current_track)
+                continue
+
+            # @on 指令（必须在 track 内）
+            on_match = re.match(r"^@on\s+(.+)$", line, re.IGNORECASE)
+            if on_match:
+                if current_track is None:
+                    raise SyntaxError(f"第 {lineno} 行: @on 必须出现在 @track 内")
+                _flush_segment()
+                rw = RelativeWindow(target_track=on_match.group(1).strip())
+                current_track.relative_windows.append(rw)
+                current_relative = rw
+                continue
+
+            # @loop 指令（必须在 track 内）
+            loop_match = re.match(r"^@loop\s+(\S+)\s+(\S+)$", line, re.IGNORECASE)
+            if loop_match:
+                if current_track is None:
+                    raise SyntaxError(f"第 {lineno} 行: @loop 必须出现在 @track 内")
+                _flush_segment()
+                current_track.loop_start = loop_match.group(1).strip()
+                current_track.loop_end = loop_match.group(2).strip()
+                current_relative = None
                 continue
 
             # @sample_rate
@@ -201,89 +415,40 @@ def parse_script(filepath: str) -> Script:
                 script.base_path = bp_match.group(1).strip()
                 continue
 
+            # @peak_limit
+            pl_match = re.match(r"^@peak_limit\s+(-?[\d.]+)$", line, re.IGNORECASE)
+            if pl_match:
+                script.peak_limit_db = float(pl_match.group(1))
+                continue
+
             raise SyntaxError(f"第 {lineno} 行: 无法识别的全局指令 '{line}'")
 
-        # segment 内部字段
+        # 非 @ 开头的行 —— track-level 字段、@on 子字段、或 segment 内字段
+        if current_track is None:
+            raise SyntaxError(f"第 {lineno} 行: 内容出现在 @track 之前: '{line}'")
+
+        # 优先级：如果在 @on 上下文中，先尝试 @on 子字段
+        if current_relative is not None and _parse_on_field(line, lineno):
+            continue
+
+        # 尝试 track-level 字段（仅当没有活跃 segment 时）
         if current_segment is None:
-            raise SyntaxError(f"第 {lineno} 行: 内容出现在 @segment 之前: '{line}'")
+            if _parse_track_field(line, lineno):
+                continue
 
-        # file:
-        file_match = re.match(r"^file:\s+(.+)$", line, re.IGNORECASE)
-        if file_match:
-            current_segment.file_path = file_match.group(1).strip()
-            continue
+        # segment 内字段
+        if current_segment is not None:
+            if _parse_segment_field(line, lineno):
+                continue
+            raise SyntaxError(f"第 {lineno} 行: 无法识别的字段 '{line}'")
+        else:
+            raise SyntaxError(f"第 {lineno} 行: 需要 @segment 或合法的 track 字段，而不是 '{line}'")
 
-        # tts:
-        tts_match = re.match(r'^tts:\s+"(.+)"$', line, re.IGNORECASE)
-        if tts_match:
-            current_segment.tts_text = tts_match.group(1)
-            continue
+    _flush_segment()
 
-        # voice:
-        voice_match = re.match(r"^voice:\s+(.+)$", line, re.IGNORECASE)
-        if voice_match:
-            current_segment.tts_voice = voice_match.group(1).strip()
-            continue
-
-        # ref_text:
-        rt_match = re.match(r'^ref_text:\s+"(.+)"$', line, re.IGNORECASE)
-        if rt_match:
-            current_segment.tts_ref_text = rt_match.group(1)
-            continue
-
-        # trim:
-        trim_match = re.match(r"^trim:\s+(.+?)\s+(.+)$", line, re.IGNORECASE)
-        if trim_match:
-            current_segment.trim_start = parse_time(trim_match.group(1))
-            current_segment.trim_end = parse_time(trim_match.group(2))
-            continue
-
-        # vol: 支持格式:
-        #   vol: 0s-1s L0.5 R0.8      (正时间区间)
-        #   vol: -3s- R1.5            (从倒数 3 秒到结尾)
-        #   vol: 5s- -2s A1.0         (含负值结束时间)
-        vol_match = re.match(
-            r"^vol:\s+(-?[\d.]+[s%]?)\s*-\s*(-?[\d.]+[s%]?)?\s+(.+)$",
-            line, re.IGNORECASE
-        )
-        if vol_match:
-            start_str = vol_match.group(1)
-            end_str = vol_match.group(2)  # 可能为 None（表示到结尾）
-            spec_str = vol_match.group(3).strip()
-
-            start = parse_time(start_str)
-            end = parse_time(end_str) if end_str else None
-
-            left_gain, right_gain, all_gain = parse_vol_spec(spec_str)
-            current_segment.vol_commands.append(
-                VolCommand(start=start, end=end,
-                           left_gain=left_gain, right_gain=right_gain,
-                           all_gain=all_gain)
-            )
-            continue
-
-        # gap:
-        gap_match = re.match(r"^gap:\s+(.+)$", line, re.IGNORECASE)
-        if gap_match:
-            gap_str = gap_match.group(1).strip()
-            current_segment.gap = parse_time(gap_str).value
-            # gap 的正负号由 TimeValue.is_negative 决定
-            if parse_time(gap_str).is_negative:
-                current_segment.gap = -current_segment.gap
-            continue
-
-        raise SyntaxError(f"第 {lineno} 行: 无法识别的字段 '{line}'")
-
-    # 最后一个 segment
-    if current_segment is not None:
-        script.segments.append(current_segment)
-
-    if not script.segments:
-        raise ValueError("脚本中没有定义任何 @segment")
-
+    if not script.tracks:
+        raise ValueError("脚本中没有定义任何 @track")
     return script
-
-
 # ============================================================
 # 3. 音频加载与转换
 # ============================================================
@@ -499,36 +664,40 @@ def normalize_loudness(data: np.ndarray, base_volume: float) -> np.ndarray:
 # 5. TTS 集成
 # ============================================================
 
-def generate_tts(text: str, voice_path: str, ref_text: str,
+def generate_tts(text: str, voice_path: Optional[str], ref_text: Optional[str],
                  target_sr: int, base_path: str) -> np.ndarray:
     """
     调用 OmniVoice 模型进行语音合成。
     返回 float32 numpy 数组（单声道）。
+    voice_path 或 ref_text 缺省时，交给 OmniVoice 自己处理默认值。
     """
-    # 解析 voice 路径
-    if not os.path.isabs(voice_path):
-        voice_path = os.path.join(base_path, voice_path)
+    kwargs = {"text": text}
+    if ref_text is not None:
+        kwargs["ref_text"] = ref_text
 
-    # MP3 等格式先转 WAV
-    input_file = voice_path
-    if not input_file.endswith(".wav"):
-        wav_file = input_file.rsplit(".", 1)[0] + ".wav"
-        if not os.path.exists(wav_file):
-            subprocess.run([
-                "ffmpeg", "-y", "-i", input_file,
-                "-ar", "24000", "-ac", "1", wav_file,
-            ], capture_output=True)
-        input_file = wav_file
+    if voice_path is None:
+        # 不指定 voice，让 OmniVoice 用其默认音色
+        print(f'  [TTS] 合成（OmniVoice 默认音色）: "{text[:40]}{"..." if len(text) > 40 else ""}"')
+    else:
+        # 解析 voice 路径
+        if not os.path.isabs(voice_path):
+            voice_path = os.path.join(base_path, voice_path)
+        # MP3 等格式先转 WAV
+        input_file = voice_path
+        if not input_file.endswith(".wav"):
+            wav_file = input_file.rsplit(".", 1)[0] + ".wav"
+            if not os.path.exists(wav_file):
+                subprocess.run([
+                    "ffmpeg", "-y", "-i", input_file,
+                    "-ar", "24000", "-ac", "1", wav_file,
+                ], capture_output=True)
+            input_file = wav_file
+        if not os.path.exists(input_file):
+            raise FileNotFoundError(f"TTS 参考音频不存在: {input_file}")
+        kwargs["ref_audio"] = input_file
+        print(f'  [TTS] 合成: "{text[:40]}{"..." if len(text) > 40 else ""}"')
 
-    if not os.path.exists(input_file):
-        raise FileNotFoundError(f"TTS 参考音频不存在: {input_file}")
-
-    print(f'  [TTS] 合成: "{text[:40]}{"..." if len(text) > 40 else ""}"')
-    audio = _get_tts_model().generate(
-        text=text,
-        ref_audio=input_file,
-        ref_text=ref_text,
-    )
+    audio = _get_tts_model().generate(**kwargs)
 
     # audio[0] 是生成的音频 numpy 数组
     data = audio[0]
@@ -553,97 +722,181 @@ def generate_tts(text: str, voice_path: str, ref_text: str,
 # 6. 组装输出
 # ============================================================
 
-def assemble_output(processed_segments: list, gaps: list,
-                    sr: int) -> np.ndarray:
-    """
-    将所有处理后的音频片段按 gap 拼接为最终输出。
 
-    processed_segments: list of (data, sr) 元组，data 为 numpy 数组
-    gaps: 每个 segment 之后的间隔秒数（正=静音，负=重叠），
-          最后一个 gap 为 None（不考虑）
-    返回拼接后的 numpy 数组。
+def _process_segment_data(seg: Segment, sr: int, base_path: str,
+                         base_volume: Optional[float]) -> np.ndarray:
+    """处理单个 segment，返回音频数据 numpy 数组。"""
+    # 加载音频
+    if seg.file_path:
+        data, _ = load_audio(seg.file_path, sr, base_path)
+    elif seg.tts_text:
+        # 显式声明则用之；缺省则交给 OmniVoice 自己处理默认值
+        voice = seg.tts_voice
+        ref = seg.tts_ref_text
+        data = generate_tts(seg.tts_text, voice, ref, sr, base_path)
+    else:
+        raise ValueError(f"片段 '{seg.name}' 缺少 file 或 tts 定义")
+
+    # 截取
+    if seg.trim_start is not None and seg.trim_end is not None:
+        data = apply_trim(data, sr, seg.trim_start, seg.trim_end)
+
+    # 响度归一化
+    if base_volume is not None:
+        data = normalize_loudness(data, base_volume)
+
+    # 音量控制
+    if seg.vol_commands:
+        data = apply_volume_commands(data, sr, seg.vol_commands)
+
+    return data
+
+
+def _render_track(track: Track, sr: int, base_path: str,
+                  base_volume: Optional[float],
+                  force_stop: Optional[float] = None) -> np.ndarray:
     """
-    if not processed_segments:
+    渲染一条音轨，返回其整轨音频 numpy 数组。
+    如果 force_stop 非 None，到达该秒数后停止（用于 @on end_relative）。
+    """
+    if not track.segments:
         return np.array([], dtype=np.float32)
 
-    # 确定声道数（取所有片段中的最大声道数）
-    max_channels = 1
-    for data, _ in processed_segments:
-        if data.ndim == 1:
-            ch = 1
-        else:
-            ch = data.shape[1]
-        max_channels = max(max_channels, ch)
+    # 检查是否有循环区间
+    has_loop = track.loop_start is not None and track.loop_end is not None
+    loop_start_idx = loop_end_idx = -1
+    if has_loop:
+        for i, seg in enumerate(track.segments):
+            if seg.name == track.loop_start:
+                loop_start_idx = i
+            if seg.name == track.loop_end:
+                loop_end_idx = i
+        if loop_start_idx < 0 or loop_end_idx < 0:
+            raise ValueError(f"Track '{track.name}': @loop 中的段名 '{track.loop_start}' 或 '{track.loop_end}' 未找到")
 
-    # 统一所有片段到 max_channels
-    unified_segments = []
-    for data, _ in processed_segments:
-        if data.ndim == 1 and max_channels > 1:
-            # 单声道扩展为立体声
-            data = np.column_stack([data, data])
-        elif data.ndim > 1 and data.shape[1] < max_channels:
-            # 补齐声道
-            pad_ch = max_channels - data.shape[1]
-            data = np.pad(data, ((0, 0), (0, pad_ch)), mode='constant')
-        unified_segments.append(data)
+    # 第一遍：计算每个 segment 的音频数据和时长
+    seg_datas = []
+    seg_durations = []
+    for seg in track.segments:
+        data = _process_segment_data(seg, sr, base_path, base_volume)
+        seg_datas.append(data)
+        seg_durations.append(len(data) / sr)
 
-    # 计算总长度
-    # 布局: [seg0][gap0][seg1][gap1][seg2]...
-    # 负 gap = 重叠，seg1 从 seg0 结束往前 |gap| 处开始
-    total_frames = 0
-    positions = []  # 每个 segment 的起始帧位置
+    # 展开时间线（处理循环）
+    MAX_LOOP_ITER = 100
+    timeline = []  # list of (seg_idx, data) 按播放顺序
 
-    for i, data in enumerate(unified_segments):
-        if i == 0:
-            positions.append(0)
-            total_frames = len(data)
-        else:
-            gap = gaps[i - 1] if i - 1 < len(gaps) else 0.0
-            prev_end = positions[i - 1] + len(unified_segments[i - 1])
-            if gap >= 0:
-                # 正间隔：在上一段结束后加 gap 秒静音
-                start_frame = prev_end + int(gap * sr)
+    if has_loop:
+        # 非循环前缀（loop_start_idx 之前）
+        for i in range(0, loop_start_idx):
+            timeline.append((i, seg_datas[i]))
+        # 循环体
+        loop_body = list(range(loop_start_idx, loop_end_idx + 1))
+        loop_count = 0
+        while loop_count < MAX_LOOP_ITER:
+            for seg_idx in loop_body:
+                timeline.append((seg_idx, seg_datas[seg_idx]))
+                # 检查是否超过 force_stop
+                if force_stop is not None:
+                    total_s = sum(seg_durations[idx] + 0 for idx, _ in timeline)  # approx
+                    if total_s >= force_stop:
+                        break
             else:
-                # 负间隔（重叠）：从前一段结束往前 |gap| 秒开始
-                start_frame = prev_end + int(gap * sr)  # gap 为负
-            positions.append(start_frame)
-            total_frames = max(total_frames, start_frame + len(data))
+                loop_count += 1
+                continue
+            break
+    else:
+        for i in range(len(track.segments)):
+            timeline.append((i, seg_datas[i]))
 
-    # 构建输出缓冲区
-    output = np.zeros((total_frames, max_channels), dtype=np.float32)
+    # 第二遍：在关键时间轴上组装（带 delay）
+    # timeline 内：第一个 segment 的 delay 相对 0；后续 segment 的 delay 相对前一个 segment 的起始
+    intervals = []  # (data, start_frames)
+    current_frame = 0
 
-    for i, data in enumerate(unified_segments):
-        start = positions[i]
+    for t_idx, (seg_idx, data) in enumerate(timeline):
+        seg = track.segments[seg_idx]
+        seg_delay = seg.delay or 0.0
+
+        # 再入规则：如果循环再入（t_idx > 0 且前一个是 loop_end），delay 相对上一个 segment 的结束
+        # 但这里 timeline 已展开，直接用上一次的 end 加 delay
+        if t_idx > 0:
+            prev_end_frame = intervals[-1][1] + len(intervals[-1][0])
+            current_frame = prev_end_frame + int(seg_delay * sr)
+        else:
+            # 第一个 segment：delay 相对 0
+            current_frame = int(seg_delay * sr)
+
+        if current_frame < 0:
+            current_frame = 0
+        intervals.append((data, current_frame))
+
+    # 构建单轨输出
+    total_frames = 0
+    for data, start in intervals:
+        total_frames = max(total_frames, start + len(data))
+
+    is_stereo = any(d.ndim > 1 and d.shape[1] >= 2 for d in seg_datas)
+    n_channels = 2 if is_stereo else 1
+
+    if n_channels == 1:
+        track_out = np.zeros(total_frames, dtype=np.float32)
+    else:
+        track_out = np.zeros((total_frames, n_channels), dtype=np.float32)
+
+    for data, start in intervals:
         end = start + len(data)
-        if data.ndim == 1:
-            data = data.reshape(-1, 1)
-        # 叠加（处理重叠区域的混音）
-        output[start:end] += data
+        if data.ndim == 1 and n_channels > 1:
+            data = np.column_stack([data, data])
+        track_out[start:end] += data
 
-    # 归一化：防止叠加区域削波
-    max_val = np.max(np.abs(output))
-    if max_val > 1.0:
-        output /= max_val
+    # 应用 track 级别的 volume / pan
+    if track.volume != 1.0:
+        track_out *= track.volume
+    if track.pan != 0.0 and n_channels >= 2:
+        pan_val = float(track.pan)
+        left_gain = min(1.0, 1.0 - pan_val)
+        right_gain = min(1.0, 1.0 + pan_val)
+        track_out[:, 0] *= left_gain
+        track_out[:, 1] *= right_gain
 
-    # 如果所有输入都是单声道，输出也保持单声道
-    if max_channels == 1:
-        output = output.flatten()
+    # 应用 track 根级别的渐入/渐出（取所有 @on 中最长的 fade）
+    fade_in_s = max((rw.fade_in_sec for rw in track.relative_windows), default=0.0)
+    fade_out_s = max((rw.fade_out_sec for rw in track.relative_windows), default=0.0)
 
-    return output
+    if fade_in_s > 0 and len(track_out) > 0:
+        dur = len(track_out) / sr
+        ramp_len = min(int(fade_in_s * sr), len(track_out))
+        ramp = np.linspace(0, 1, ramp_len, dtype=np.float32)
+        if n_channels >= 2:
+            track_out[:ramp_len, 0] *= ramp
+            track_out[:ramp_len, 1] *= ramp
+        else:
+            track_out[:ramp_len] *= ramp
 
+    if fade_out_s > 0 and len(track_out) > 0:
+        ramp_len = min(int(fade_out_s * sr), len(track_out))
+        ramp = np.linspace(1, 0, ramp_len, dtype=np.float32)
+        if n_channels >= 2:
+            track_out[-ramp_len:, 0] *= ramp
+            track_out[-ramp_len:, 1] *= ramp
+        else:
+            track_out[-ramp_len:] *= ramp
 
-# ============================================================
-# 7. 主流程
-# ============================================================
+    # 截断
+    if force_stop is not None:
+        stop_frame = int(force_stop * sr)
+        if stop_frame < len(track_out):
+            track_out = track_out[:stop_frame]
+
+    return track_out
+
 
 def execute_script(script: Script, output_path: str,
                    cli_base_path: Optional[str] = None) -> None:
-    """
-    执行脚本，生成最终音频文件。
-    """
+    """执行脚本，生成最终音频文件。"""
     sr = script.sample_rate
 
-    # base_path: CLI 参数覆盖脚本中的设置
     base_path = cli_base_path if cli_base_path else script.base_path
     base_path = os.path.abspath(base_path)
 
@@ -651,67 +904,140 @@ def execute_script(script: Script, output_path: str,
     print(f"基路径: {base_path}")
     if script.base_volume is not None:
         print(f"响度基准线: {script.base_volume} (RMS)")
-    print(f"片段数: {len(script.segments)}")
+    if script.peak_limit_db != 0.0:
+        print(f"总线峰值上限: {script.peak_limit_db} dBFS")
+    print(f"音轨数: {len(script.tracks)}")
     print()
 
-    processed = []
-    gaps = []
+    # ---- 拓扑排序：处理 @on 依赖 ----
+    track_map = {t.name: t for t in script.tracks}
+    in_degree = {t.name: 0 for t in script.tracks}
+    for t in script.tracks:
+        for rw in t.relative_windows:
+            if rw.target_track in in_degree:
+                in_degree[t.name] += 1
 
-    for idx, seg in enumerate(script.segments):
-        print(f"[{idx + 1}/{len(script.segments)}] {seg.name}")
+    queue = [n for n, deg in in_degree.items() if deg == 0]
+    sorted_order = []
+    while queue:
+        cur = queue.pop(0)
+        sorted_order.append(cur)
+        for t in script.tracks:
+            for rw in t.relative_windows:
+                if rw.target_track == cur:
+                    in_degree[t.name] -= 1
+                    if in_degree[t.name] == 0:
+                        queue.append(t.name)
 
-        # --- 5.1 加载音频 ---
-        if seg.file_path:
-            print(f"  加载: {seg.file_path}")
-            data, _ = load_audio(seg.file_path, sr, base_path)
-        elif seg.tts_text:
-            print(f"  TTS 合成")
-            voice = seg.tts_voice or "sample.wav"
-            ref = seg.tts_ref_text or "大家好，这里是胡聊瞎侃嘚啵嘚播客，我是主持人塔塔"
-            data = generate_tts(seg.tts_text, voice, ref, sr, base_path)
-        else:
-            raise ValueError(f"片段 '{seg.name}' 缺少 file 或 tts 定义")
+    if len(sorted_order) != len(script.tracks):
+        raise ValueError("音轨间存在循环依赖，无法继续")
 
-        print(f"  原始: {len(data) / sr:.2f} 秒, shape={data.shape}, RMS={compute_rms(data):.4f}")
+    # ---- 渲染每个 track ----
+    rendered = {}       # name -> np.ndarray
+    track_durations = {} # name -> float (seconds), natural end of track audio
+    track_end_times = {} # name -> float (seconds), absolute end on master timeline (for @on)
 
-        # --- 5.2 截取 ---
-        if seg.trim_start is not None and seg.trim_end is not None:
-            data = apply_trim(data, sr, seg.trim_start, seg.trim_end)
-            print(f"  截取后: {len(data) / sr:.2f} 秒")
+    for tname in sorted_order:
+        t = track_map[tname]
+        print(f"[Track] {tname} ({len(t.segments)} segments)")
 
-        # --- 5.3 响度归一化 ---
-        if script.base_volume is not None:
-            rms_before = compute_rms(data)
-            data = normalize_loudness(data, script.base_volume)
-            rms_after = compute_rms(data)
-            gain_db = 20 * np.log10(max(rms_after, 1e-10) / max(rms_before, 1e-10))
-            print(f"  响度归一化: RMS {rms_before:.4f} → {rms_after:.4f} ({gain_db:+.1f} dB)")
+        # 确定强制停止时间：所有 @on 的 end_relative 中取最早的
+        force_stop = None
+        for rw in t.relative_windows:
+            if rw.end_relative is not None and rw.target_track in track_end_times:
+                target_end = track_end_times[rw.target_track]
+                cand = max(0.0, target_end + rw.end_relative)
+                if force_stop is None or cand < force_stop:
+                    force_stop = cand
+        if force_stop is not None:
+            print(f"  @on end_relative → 最早截断于 {force_stop:.2f}s")
 
-        # --- 5.4 音量控制 ---
-        if seg.vol_commands:
-            data = apply_volume_commands(data, sr, seg.vol_commands)
-            print(f"  音量控制: {len(seg.vol_commands)} 条指令")
+        # 渲染
+        track_data = _render_track(
+            t, sr, base_path,
+            script.base_volume, force_stop
+        )
 
-        # --- 5.5 记录 gap ---
-        if seg.gap is not None and idx < len(script.segments) - 1:
-            gaps.append(seg.gap)
-            print(f"  间隔: {seg.gap:+.2f}s")
-        elif idx < len(script.segments) - 1:
-            gaps.append(0.0)  # 默认无间隔
+        nat_dur = len(track_data) / sr
+        rendered[tname] = track_data
+        track_durations[tname] = nat_dur
+        print(f"  自然时长: {nat_dur:.2f} 秒")
 
-        processed.append((data, sr))
-        print(f"  最终: {len(data) / sr:.2f} 秒\n")
+    # ---- 计算各 track 在 master 上的绝对位置 ----
+    track_positions = {}  # name -> frame offset (int)
+    max_end_frame = 0
 
-    # --- 6. 组装 ---
-    print("组装输出...")
-    output = assemble_output(processed, gaps, sr)
-    total_duration = len(output) / sr if output.ndim == 1 else output.shape[0] / sr
+    for tname in sorted_order:
+        t = track_map[tname]
+        # 基础位置：整轨 delay
+        base_frame = int(t.delay * sr)
+
+        # @on: 多个 @on 共存时，取首个给出起始约束的 @on
+        # （after_start 优先级 > after_end）
+        for rw in t.relative_windows:
+            if rw.target_track not in track_end_times:
+                continue
+            target_start = track_positions.get(rw.target_track, 0)
+            target_dur_frames = int(track_durations.get(rw.target_track, 0) * sr)
+            target_end_frame = target_start + target_dur_frames
+            if rw.after_start is not None:
+                base_frame = target_start + int(rw.after_start * sr)
+            else:
+                base_frame = target_end_frame + int(rw.after_end * sr)
+            break  # 只用第一个给出起始约束的 @on
+
+        if base_frame < 0:
+            base_frame = 0
+
+        track_positions[tname] = base_frame
+        track_end_times[tname] = base_frame / sr + track_durations[tname]
+        end_frame = base_frame + int(track_durations[tname] * sr)
+        if end_frame > max_end_frame:
+            max_end_frame = end_frame
+        print(f"  master 位置: {base_frame / sr:.2f}s → {end_frame / sr:.2f}s")
+
+    # ---- 混合到 master ----
+    max_channels = 1
+    for data in rendered.values():
+        if data.ndim > 1:
+            max_channels = max(max_channels, data.shape[1])
+
+    if max_channels > 1:
+        master = np.zeros((max_end_frame, max_channels), dtype=np.float32)
+    else:
+        master = np.zeros(max_end_frame, dtype=np.float32)
+
+    for tname in sorted_order:
+        data = rendered[tname]
+        start = track_positions[tname]
+        end = start + len(data)
+
+        if data.ndim == 1 and max_channels > 1:
+            data = np.column_stack([data, data])
+
+        master[start:end] += data
+
+    # ---- 总线峰值限制 ----
+    peak = float(np.max(np.abs(master)))
+    peak_db = 20 * np.log10(max(peak, 1e-10))
+    limit_linear = 10 ** (script.peak_limit_db / 20.0)
+    print(f"  混合后峰值: {peak_db:.1f} dBFS (限制阈值: {script.peak_limit_db} dBFS)")
+    if peak > limit_linear:
+        factor = limit_linear / peak
+        master *= factor
+        print(f"  已限制: 缩放系数 {factor:.3f}")
+    elif peak > 1.0:
+        master /= peak  # 硬裁剪到 0 dBFS
+        print(f"  已裁剪到 0 dBFS")
+
+    if max_channels == 1:
+        master = master.flatten()
+
+    total_duration = len(master) / sr
     print(f"总时长: {total_duration:.2f} 秒")
 
-    # --- 7. 写入 ---
-    sf.write(output_path, output, sr)
+    sf.write(output_path, master, sr)
     print(f"\n✅ 输出完成: {output_path}")
-
 
 def main():
     parser = argparse.ArgumentParser(

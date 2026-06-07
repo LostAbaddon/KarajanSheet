@@ -37,5 +37,6 @@ ENV/
 test_*.py
 
 # Excluded data files
+docs/
 sample.txt
 script.md
