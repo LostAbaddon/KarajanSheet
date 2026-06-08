@@ -6,9 +6,12 @@
 
 - **多音轨编排（Track）** — 任意条音轨并行播放，统一应用音量、声道、延迟；多条音轨按时间轴叠加输出
 - **声音预设（@voice）** — 全局定义音色 + 参考文本，TTS 段用 `ref_voice` 一行引用，避免每段重复样板代码
+- **声音设计（`instruct:`）** — 用属性标签（`male, young adult, 四川话` 等）描述目标声音，**无需参考音频**即可合成特定音色
+- **语速控制（`speed:`）** — 段级 `speed: 1.4` 加速、`speed: 0.8` 减速
+- **长文本文件驱动 TTS** — `file: script.md` 自动读取文本内容作为 TTS 源；支持 `.txt` / `.md` / `.markdown` / `.rst` / `.text`
 - **相对时间控制（@on）** — 一条音轨可以相对另一条音轨/段的开始/结束时间设定自己的开始点与结束点；同一音轨可写多条 @on；**track 优先**解析
 - **循环区间（@loop）** — 音轨内任意闭区间无限循环，可被 @on 的 `end_relative` 强制截断
-- **TTS 集成** — 内置 [OmniVoice](https://github.com/k2-fsa/OmniVoice) 语音合成，支持音色克隆；支持 `ref_audio` + `ref_text` 显式声明，或通过 `ref_voice` 引用 @voice 预设
+- **TTS 集成** — 内置 [OmniVoice](https://github.com/k2-fsa/OmniVoice) 语音合成，支持音色克隆与声音设计；支持 `ref_audio` + `ref_text` 显式声明、`instruct:` 声音设计、或通过 `ref_voice` 引用 @voice 预设
 - **多格式支持** — 自动处理 mp3/wav/m4a/flac 等常见音频格式
 - **总线峰值限制** — `@peak_limit` 防止多轨叠加后爆音
 - **批量合成** — 提供长文本分批 TTS 合成与自动拼接工具
@@ -83,7 +86,7 @@ pip install omnivoice numpy soundfile torch
 ### 2. 执行脚本
 
 ```bash
-python audio_script.py -s example.audio -o output.wav
+python karajan_sheet.py -s example.audio -o output.wav
 ```
 
 ### 3. 批量 TTS 合成
@@ -103,34 +106,38 @@ python solo_tts.py \
 
 关键概念速览：
 
-- **@voice** — 全局声音预设，含 `audio` 和 `text`；段内用 `ref_voice: <name>` 引用，可被段内的 `ref_audio` / `ref_text` 覆盖
+- **@voice** — 全局声音预设。**所有子字段都可选**——可以只写 `audio` + `text`（克隆模式）、只写 `instruct:`（声音设计模式）、三者都写、甚至全空。段内用 `ref_voice: <name>` 引用，可被段内的 `ref_audio` / `ref_text` / `instruct:` 覆盖
 - **Track** — 一条音轨，包含任意条 @segment 与整轨级设置（volume / pan / delay）
 - **@on** — 相对时间控制，可写多条；目标可以是音轨名或段名（**音轨优先**）；首个给出起始约束的 @on 决定开始点，所有给出 `end_relative` 的 @on 取最早时间点作为截断
 - **@loop** — 音轨内循环区间，再入时第一段的 `delay` 相对上一轮最后一段的结束点
 - **delay** — 段前延迟（替代旧版 `gap`），正=静音，负=与前段重叠
 - **peak_limit** — 全局总线峰值上限（dBFS），防止叠加爆音
+- **TTS 段字段**（**全部可选**，未设置时走 OmniVoice 默认）：`instruct:` 描述声音属性、`speed:` 控制语速、`file:` 指向 `.md` / `.txt` 等纯文本时自动读为 TTS 源
 
 ## TTS 引擎
 
-本项目使用 **[OmniVoice](https://github.com/k2-fsa/OmniVoice)** 作为语音合成引擎。OmniVoice 是一个基于语音离散化标记的 zero-shot 大规模 TTS 模型，能够通过参考音频实现高保真的音色克隆。
+本项目使用 **[OmniVoice](https://github.com/k2-fsa/OmniVoice)** 作为语音合成引擎。OmniVoice 是一个基于语音离散化标记的 zero-shot 大规模 TTS 模型，支持 646 种语言，能够通过参考音频实现高保真的音色克隆，也能通过属性标签做"声音设计"（无需参考音频）。
 
 - 官网/GitHub: [https://github.com/k2-fsa/OmniVoice](https://github.com/k2-fsa/OmniVoice)
 - HuggingFace 模型: [k2-fsa/OmniVoice](https://huggingface.co/k2-fsa/OmniVoice)
+- 完整参数速查表：[OmniVoice 使用指南.md](OmniVoice使用指南.md)
 
-> **v1.2 起推荐做法**：定义一个 `@voice` 预设保存音色参考音频与文本，段内用 `ref_voice: <name>` 引用。如果需要临时覆盖，使用 `ref_audio:` 或 `ref_text:` 显式声明即可。
+> **零配置 TTS 完全合法**：OmniVoice 有完整的默认配置。TTS 段**可以不写任何** `ref_audio` / `ref_text` / `instruct` / `speed` / `ref_voice`——直接 `tts: "..."` 就能让 OmniVoice 用默认音色/语速合成。Karajan 不做任何强制参数要求。
+>
+> **v1.2 起推荐做法**：定义一个 `@voice` 预设保存音色参考音频与文本，段内用 `ref_voice: <name>` 引用。预设可以是**克隆模式**（`audio` + `text`）或**声音设计模式**（`instruct:`，无需参考音频）。如果需要临时覆盖，使用 `ref_audio:` / `ref_text:` / `instruct:` 显式声明即可。
 
 ## v1.2 新特性
 
 相比 v1.1：
 
-1. **`ref_audio:` 字段已重命名为 `ref_audio:`**（与 OmniVoice 模型底层 API 对齐）
+1. **`voice:` 字段已重命名为 `ref_audio:`**（与 OmniVoice 模型底层 API 对齐）
 2. **新增 `@voice` 声音预设** — 全局声明可复用的音色配置
 3. **`@on` 支持段目标** — 目标可以是音轨名或段名；同名时**音轨优先**
 4. **预处理五步流程** — `execute_script` 显式拆分为 A 探测 / B 固定点 / C 推算点 / D 时间段 / E 合成
 
 ## 命令行参数
 
-### audio_script.py
+### karajan_sheet.py
 
 | 参数 | 简写 | 说明 | 默认值 |
 |------|------|------|--------|

@@ -21,11 +21,18 @@
 
 	@segment intro
 		tts: "这是一个关于音频脚本引擎的演示"
+		delay: -0.3s
 
 	@segment narration
-		tts: "我是节目主持人，我叫塔塔，大家好，哇哈哈哈哈哈～～～～Aloha Kosmos!"
-		ref_voice: host
-		delay: -0.5s
+		tts: "大家好。Aloha Kosmos!"
+		instruct: "male, child, low pitch"
+		speed: 1.25
+
+	@segment narration
+		tts: "大家好。私が名探偵、工藤タタだ！Aloha Kosmos!"
+#		tts: "大家好。Aloha Kosmos!"
+		instruct: "female, young adult, moderate pitch"
+		speed: 1.25
 
 # ============================================================
 # 音轨 B：背景音乐
@@ -38,7 +45,7 @@
 #	- @loop bgm_a bgm_b → 循环直到被 end_relative 截断
 # ============================================================
 @track bgm
-	volume: 0.3
+	volume: 0.05
 	pan: -0.4
 	delay: 0s
 
@@ -65,7 +72,7 @@
 		vol: 3s-4s R0.0->1.0 L1.0->0.0
 
 @track insert
-	volume: 0.5
+	volume: 0.05
 
 	@on narration
 		after_start: 0.2s

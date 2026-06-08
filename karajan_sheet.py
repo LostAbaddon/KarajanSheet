@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Audio Script Engine - 自定义音频脚本语言解析与执行器 v1.2
+Karajan Sheet Engine - 自定义音频脚本语言解析与执行器 v1.2
 
 脚本语法概览:
     @sample_rate 24000          # 输出采样率（可选，默认 24000）
@@ -34,11 +34,13 @@ Audio Script Engine - 自定义音频脚本语言解析与执行器 v1.2
         @loop <start> <end>     # 循环区间（段名，闭区间，可选）
 
         @segment <name>         # 定义一个音频片段
-            file: <path>        # 音频文件（支持 mp3/wav/m4a/flac 等）
+            file: <path>        # 音频文件（mp3/wav/m4a/flac 等）；如指向 .txt/.md 等纯文本则自动作为 TTS 文本读取
             tts: "<text>"       # TTS 合成文本（与 file 二选一）
             ref_audio: <path>   # TTS 音色参考音频（配合 tts 使用）
             ref_text: "<text>"  # TTS 参考文本（配合 tts 使用）
             ref_voice: <name>   # 引用全局 @voice 预设（配合 tts 使用）
+            instruct: "<attr>"  # TTS 声音设计属性（与 ref_audio/ref_text 二选一）
+            speed: <float>      # TTS 语速因子（>1 加速，<1 减速，默认 1.0）
             trim: <start> <end> # 截取时间区间
             vol: <range> <spec> # 音量控制（可多条）
             delay: <time>       # 段前延迟（正=静音，负=与上一段重叠）
@@ -63,23 +65,41 @@ from omnivoice import OmniVoice
 
 
 # ============================================================
+# 0. 文本文件扩展名白名单（file: 指向这些扩展名时自动走 TTS）
+# ============================================================
+_TEXT_FILE_EXTS = {".txt", ".md", ".markdown", ".rst", ".text"}
+
+
+def _is_text_file(path: str) -> bool:
+    """判断文件扩展名是否属于纯文本白名单。"""
+    return os.path.splitext(path)[1].lower() in _TEXT_FILE_EXTS
+
+
+# ============================================================
 # 0. TTS 模型全局缓存（避免重复加载造成 MPS 假死）
 # ============================================================
 
 _tts_model = None
 
-
 def _get_tts_model():
     global _tts_model
     if _tts_model is None:
         print("加载 TTS 模型...")
+        # 自动检测 Mac 是否支持 MPS 加速（Apple M系列芯片），否则使用 CPU
+        if torch.backends.mps.is_available():
+            device = "mps"
+            # M系列芯片支持 float16，但如果有算子报错，可改为 torch.float32
+            model_dtype = torch.float16
+        else:
+            device = "cpu"
+            model_dtype = torch.float32 # CPU 下使用 float32 更稳定
+
         _tts_model = OmniVoice.from_pretrained(
             "k2-fsa/OmniVoice",
-            device_map="mps",
-            dtype=torch.float16
+            device_map=device,
+            dtype=model_dtype
         )
     return _tts_model
-
 
 # ============================================================
 # 1. 数据模型 (AST)
@@ -102,7 +122,6 @@ class TimeValue:
             seconds = total_seconds + seconds  # seconds 本身为负
         return max(0.0, min(seconds, total_seconds))
 
-
 @dataclass
 class VolCommand:
     """一条音量控制指令。支持 -> 渐变。"""
@@ -115,7 +134,6 @@ class VolCommand:
     to_right_gain: Optional[float] = None
     to_all_gain: Optional[float] = None
 
-
 @dataclass
 class Segment:
     """一个音频片段定义。"""
@@ -125,11 +143,12 @@ class Segment:
     tts_ref_audio: Optional[str] = None       # TTS 参考音频
     tts_ref_text: Optional[str] = None    # TTS 参考文本
     tts_ref_voice: Optional[str] = None   # TTS 预设音色
+    tts_instruct: Optional[str] = None    # TTS 声音设计属性（Voice Design）
+    tts_speed: Optional[float] = None     # TTS 语速因子（>1 加速，<1 减速，默认 1.0）
     trim_start: Optional[TimeValue] = None
     trim_end: Optional[TimeValue] = None
     vol_commands: list = field(default_factory=list)  # list[VolCommand]
     delay: Optional[float] = None          # 段前延迟（正=静音，负=与前段重叠）
-
 
 @dataclass
 class RelativeWindow:
@@ -174,6 +193,7 @@ class VoiceDef:
     name: str
     audio: Optional[str] = None
     text: Optional[str] = None
+    instruct: Optional[str] = None
 
 @dataclass
 class Script:
@@ -183,7 +203,6 @@ class Script:
     peak_limit_db: float = 0.0              # @peak_limit（默认 0 dBFS）
     voice_defs: dict = field(default_factory=dict)
     tracks: list = field(default_factory=list)   # list[Track]
-
 
 # ============================================================
 # 2. 语法解析器
@@ -206,7 +225,6 @@ def parse_time(s: str) -> TimeValue:
     except ValueError:
         raise ValueError(f"无法解析时间值: '{s}'（原始: '{s}')")
     return TimeValue(value=value, is_negative=is_negative, is_percent=is_percent)
-
 
 def parse_vol_spec(spec: str) -> tuple:
     """
@@ -231,7 +249,6 @@ def parse_vol_spec(spec: str) -> tuple:
         elif ch == "A":
             all_gain, to_all = v1, v2
     return left_gain, right_gain, all_gain, to_left, to_right, to_all
-
 
 def parse_script(filepath: str) -> Script:
     """解析脚本文件，返回 Script AST。"""
@@ -356,6 +373,16 @@ def parse_script(filepath: str) -> Script:
         rv_match = re.match(r"^ref_voice:\s+(.+)$", line, re.IGNORECASE)
         if rv_match:
             current_segment.tts_ref_voice = rv_match.group(1).strip()
+            return True
+        # instruct:（声音设计属性，Voice Design）
+        instruct_match = re.match(r'^instruct:\s+"(.*)"$', line, re.IGNORECASE)
+        if instruct_match:
+            current_segment.tts_instruct = instruct_match.group(1)
+            return True
+        # speed:（语速因子，>1 加速，<1 减速）
+        speed_match = re.match(r"^speed:\s*([\d.]+)$", line, re.IGNORECASE)
+        if speed_match:
+            current_segment.tts_speed = float(speed_match.group(1))
             return True
         # trim:
         trim_match = re.match(r"^trim:\s+(.+?)\s+(.+)$", line, re.IGNORECASE)
@@ -493,6 +520,10 @@ def parse_script(filepath: str) -> Script:
             if text_match:
                 current_voice.text = text_match.group(1)
                 continue
+            instruct_match = re.match(r'^instruct:\s+"(.*)"$', line, re.IGNORECASE)
+            if instruct_match:
+                current_voice.instruct = instruct_match.group(1)
+                continue
             # 退场让后续解析兜底处理
             current_voice = None
 
@@ -521,6 +552,26 @@ def parse_script(filepath: str) -> Script:
 
     if not script.tracks:
         raise ValueError("脚本中没有定义任何 @track")
+
+    # R4: 将 file: 指向纯文本文件的段转换为 tts_text
+    #     （解析期做：读文件 → 写入 tts_text → 清除 file_path，使下游逻辑统一视为 TTS 段）
+    for t in script.tracks:
+        for sg in t.segments:
+            if sg.file_path and _is_text_file(sg.file_path):
+                # 解析相对路径
+                file_path = sg.file_path
+                if not os.path.isabs(file_path):
+                    file_path = os.path.join(script.base_path, file_path)
+                if not os.path.exists(file_path):
+                    raise FileNotFoundError(
+                        f"片段 '{sg.name}': 文本文件不存在: {file_path}"
+                    )
+                with open(file_path, "r", encoding="utf-8") as f:
+                    text_content = f.read().strip()
+                # 文本内容覆盖 inline tts:（与"file 优先于 tts"语义一致）
+                sg.tts_text = text_content
+                sg.file_path = None
+
     return script
 # ============================================================
 # 3. 音频加载与转换
@@ -560,7 +611,6 @@ def _convert_to_wav(input_path: str, target_sr: int = 24000) -> str:
         raise RuntimeError(f"ffmpeg 转换失败: {input_path}\n{result.stderr}")
     return tmp_path
 
-
 def _load_wav(path: str, target_sr: int) -> tuple:
     """加载 WAV 文件，重采样到 target_sr 如果需要。返回 (data, sr)。"""
     data, sr = sf.read(path)
@@ -595,7 +645,6 @@ def _load_wav(path: str, target_sr: int) -> tuple:
 
     return data, sr
 
-
 def load_audio(path: str, target_sr: int = 24000,
                base_path: str = ".") -> tuple:
     """
@@ -627,7 +676,6 @@ def load_audio(path: str, target_sr: int = 24000,
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)
 
-
 # ============================================================
 # 4. 音频处理
 # ============================================================
@@ -637,7 +685,6 @@ def compute_rms(data: np.ndarray) -> float:
     squared = data.astype(np.float64) ** 2
     mean_square = np.mean(squared)
     return float(np.sqrt(mean_square))
-
 
 def apply_trim(data: np.ndarray, sr: int,
                trim_start: TimeValue, trim_end: TimeValue) -> np.ndarray:
@@ -656,7 +703,6 @@ def apply_trim(data: np.ndarray, sr: int,
     if start_frame >= end_frame:
         start_frame = end_frame - 1
     return data[start_frame:end_frame]
-
 
 def apply_volume_commands(data: np.ndarray, sr: int,
                           vol_commands: list) -> np.ndarray:
@@ -731,7 +777,6 @@ def apply_volume_commands(data: np.ndarray, sr: int,
     else:
         return data * gain
 
-
 def normalize_loudness(data: np.ndarray, base_volume: float) -> np.ndarray:
     """
     响度归一化：将音频 RMS 对齐到 base_volume。
@@ -747,25 +792,38 @@ def normalize_loudness(data: np.ndarray, base_volume: float) -> np.ndarray:
     gain = min(gain, 10.0)
     return data * gain
 
-
 # ============================================================
 # 5. TTS 集成
 # ============================================================
 
 def generate_tts(text: str, ref_audio_path: Optional[str], ref_text: Optional[str],
-                 target_sr: int, base_path: str) -> np.ndarray:
+                 target_sr: int, base_path: str,
+                 instruct: Optional[str] = None,
+                 speed: float = 1.0) -> np.ndarray:
     """
     调用 OmniVoice 模型进行语音合成。
     返回 float32 numpy 数组（单声道）。
-    ref_audio_path 或 ref_text 缺省时，交给 OmniVoice 自己处理默认值。
+
+    三种 voice 模式（互斥）：
+      - 克隆：ref_audio_path 与 ref_text 都给出
+      - 设计：instruct 给出
+      - 缺省：两者都不给 → 走 OmniVoice 默认音色
+    speed 始终传给模型（默认 1.0）。
     """
-    kwargs = {"text": text}
+    kwargs = {"text": text, "speed": speed}
+
     if ref_text is not None:
         kwargs["ref_text"] = ref_text
 
     if ref_audio_path is None:
-        # 不指定 voice，让 OmniVoice 用其默认音色
-        print(f'  [TTS] 合成（OmniVoice 默认音色）: "{text[:40]}{"..." if len(text) > 40 else ""}"')
+        if instruct is not None:
+            # 设计模式：用属性标签描述声音
+            kwargs["instruct"] = instruct
+            print(f'  [TTS] 合成（声音设计: {instruct[:30]}{"..." if len(instruct) > 30 else ""}）: '
+                  f'"{text[:40]}{"..." if len(text) > 40 else ""}"')
+        else:
+            # 不指定 voice，让 OmniVoice 用其默认音色
+            print(f'  [TTS] 合成（OmniVoice 默认音色）: "{text[:40]}{"..." if len(text) > 40 else ""}"')
     else:
         # 解析 ref_audio 路径
         if not os.path.isabs(ref_audio_path):
@@ -783,7 +841,7 @@ def generate_tts(text: str, ref_audio_path: Optional[str], ref_text: Optional[st
         if not os.path.exists(input_file):
             raise FileNotFoundError(f"TTS 参考音频不存在: {input_file}")
         kwargs["ref_audio"] = input_file
-        print(f'  [TTS] 合成: "{text[:40]}{"..." if len(text) > 40 else ""}"')
+        print(f'  [TTS] 合成（声音克隆）: "{text[:40]}{"..." if len(text) > 40 else ""}"')
 
     audio = _get_tts_model().generate(**kwargs)
 
@@ -805,11 +863,9 @@ def generate_tts(text: str, ref_audio_path: Optional[str], ref_text: Optional[st
     print(f"  [TTS] 生成完成，{len(data) / target_sr:.1f} 秒")
     return data
 
-
 # ============================================================
 # 6. 组装输出
 # ============================================================
-
 
 def _process_segment_data(seg: Segment, sr: int, base_path: str,
                          base_volume: Optional[float],
@@ -822,6 +878,8 @@ def _process_segment_data(seg: Segment, sr: int, base_path: str,
         # 显式声明则用之；缺省则交给 OmniVoice 自己处理默认值
         ref_audio = seg.tts_ref_audio
         ref = seg.tts_ref_text
+        instruct = seg.tts_instruct
+        speed = seg.tts_speed if seg.tts_speed is not None else 1.0
         # 如果指定了预设语音，用预设覆盖未显式声明的字段
         if seg.tts_ref_voice and script is not None:
             if seg.tts_ref_voice in script.voice_defs:
@@ -830,11 +888,16 @@ def _process_segment_data(seg: Segment, sr: int, base_path: str,
                     ref_audio = vdef.audio
                 if vdef.text is not None and ref is None:
                     ref = vdef.text
+                if vdef.instruct is not None and instruct is None:
+                    instruct = vdef.instruct
             else:
                 raise ValueError(
                     f"片段 '{seg.name}': 引用了未定义的 @voice 预设 '{seg.tts_ref_voice}'"
                 )
-        data = generate_tts(seg.tts_text, ref_audio, ref, sr, base_path)
+        data = generate_tts(
+            seg.tts_text, ref_audio, ref, sr, base_path,
+            instruct=instruct, speed=speed,
+        )
     else:
         raise ValueError(f"片段 '{seg.name}' 缺少 file 或 tts 定义")
 
@@ -851,7 +914,6 @@ def _process_segment_data(seg: Segment, sr: int, base_path: str,
         data = apply_volume_commands(data, sr, seg.vol_commands)
 
     return data
-
 
 def _render_track(track: Track, sr: int, base_path: str,
                   base_volume: Optional[float],
@@ -1034,7 +1096,6 @@ def _render_track(track: Track, sr: int, base_path: str,
 
     return track_out
 
-
 def execute_script(script: Script, output_path: str,
                    cli_base_path: Optional[str] = None) -> None:
     """执行脚本，生成最终音频文件。"""
@@ -1137,13 +1198,20 @@ def execute_script(script: Script, output_path: str,
                 # 实际合成 TTS，获取真实时长
                 ref_audio = sg.tts_ref_audio
                 ref = sg.tts_ref_text
+                instruct = sg.tts_instruct
+                speed = sg.tts_speed if sg.tts_speed is not None else 1.0
                 if sg.tts_ref_voice and sg.tts_ref_voice in script.voice_defs:
                     vdef = script.voice_defs[sg.tts_ref_voice]
                     if vdef.audio is not None and ref_audio is None:
                         ref_audio = vdef.audio
                     if vdef.text is not None and ref is None:
                         ref = vdef.text
-                data = generate_tts(sg.tts_text, ref_audio, ref, sr, base_path)
+                    if vdef.instruct is not None and instruct is None:
+                        instruct = vdef.instruct
+                data = generate_tts(
+                    sg.tts_text, ref_audio, ref, sr, base_path,
+                    instruct=instruct, speed=speed,
+                )
                 seg_dur = len(data) / sr
                 durs.append(seg_dur)
                 tts_cache[(t.name, i)] = (seg_dur, data)
@@ -1360,7 +1428,7 @@ def execute_script(script: Script, output_path: str,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Audio Script Engine - 自定义音频脚本语言执行器"
+        description="Karajan Sheet Engine - 自定义音频脚本语言执行器"
     )
     parser.add_argument(
         "--script", "-s", type=str, required=True,
@@ -1381,7 +1449,6 @@ def main():
 
     # 执行
     execute_script(script, args.output, args.base_path)
-
 
 if __name__ == "__main__":
     main()
