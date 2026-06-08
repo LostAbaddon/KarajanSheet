@@ -1,6 +1,9 @@
-# Karajan v1.2
+# KarajanSheet
 
-**Karajan** 是一个基于自定义脚本语言的音频编排引擎。使用 **KarajanSheet** 脚本语法声明式地定义多音轨音频的拼接、TTS 合成、音量控制、声道分配与响度归一化，一键生成最终音频。
+> - AUTHOR: [LostAbaddon](lostabaddon@gmail.com)
+> - VERSION: 1.2.0
+
+**KarajanSheet** 是一个基于自定义脚本语言的音频编排引擎。使用 **KarajanSheet** 脚本语法声明式地定义多音轨音频的拼接、TTS 合成、音量控制、声道分配与响度归一化，一键生成最终音频。
 
 ## 特性
 
@@ -122,7 +125,7 @@ python solo_tts.py \
 - HuggingFace 模型: [k2-fsa/OmniVoice](https://huggingface.co/k2-fsa/OmniVoice)
 - 完整参数速查表：[OmniVoice 使用指南.md](OmniVoice使用指南.md)
 
-> **零配置 TTS 完全合法**：OmniVoice 有完整的默认配置。TTS 段**可以不写任何** `ref_audio` / `ref_text` / `instruct` / `speed` / `ref_voice`——直接 `tts: "..."` 就能让 OmniVoice 用默认音色/语速合成。Karajan 不做任何强制参数要求。
+> **零配置 TTS 完全合法**：OmniVoice 有完整的默认配置。TTS 段**可以不写任何** `ref_audio` / `ref_text` / `instruct` / `speed` / `ref_voice`——直接 `tts: "..."` 就能让 OmniVoice 用默认音色/语速合成。KarajanSheet 不做任何强制参数要求。
 >
 > **v1.2 起推荐做法**：定义一个 `@voice` 预设保存音色参考音频与文本，段内用 `ref_voice: <name>` 引用。预设可以是**克隆模式**（`audio` + `text`）或**声音设计模式**（`instruct:`，无需参考音频）。如果需要临时覆盖，使用 `ref_audio:` / `ref_text:` / `instruct:` 显式声明即可。
 
