@@ -3,56 +3,72 @@
 @base_path .
 @peak_limit -1.0
 
+@voice host
+	audio: sample.wav
+	text: "大家好，这里是胡聊瞎侃嘚啵嘚播客，我是主持人塔塔"
+
 # ============================================================
 # 音轨 A：主播
 # ============================================================
 @track voiceover
-    volume: 1.0
-    pan: 0
-    delay: 0s
+	volume: 1.0
+	pan: 0
+	delay: 0s
 
-    @segment intro
-        tts: "欢迎收听今天的节目，这是一个关于音频脚本引擎的演示"
-        voice: sample.wav
-        ref_text: "大家好，这里是胡聊瞎侃嘚啵嘚播客，我是主持人塔塔"
+	@segment intro
+		tts: "欢迎收听今天的节目"
+		ref_voice: host
 
-    @segment narration
-        tts: "我是节目主持人，我叫塔塔，大家好，哇哈哈哈哈哈～～～～Aloha Kosmos!"
-        delay: -0.5s
+	@segment intro
+		tts: "这是一个关于音频脚本引擎的演示"
+
+	@segment narration
+		tts: "我是节目主持人，我叫塔塔，大家好，哇哈哈哈哈哈～～～～Aloha Kosmos!"
+		ref_voice: host
+		delay: -0.5s
 
 # ============================================================
 # 音轨 B：背景音乐
-#   - volume 0.3 → 整轨 30% 音量
-#   - pan -0.4  → 偏左 40%
-#   - 两个 @on：
-#       @on voiceover  after_start: 0s     → 与主播同时开始
-#       @on voiceover  end_relative: 10.2s → 主播结束后 10.2 秒截断
-#       @on voiceover  fade_out: 1s        → 截断前最后 1 秒线性渐出至静音
-#   - @loop bgm_a bgm_b → 循环直到被 end_relative 截断
+#	- volume 0.3 → 整轨 30% 音量
+#	- pan -0.4  → 偏左 40%
+#	- 两个 @on：
+#		@on voiceover  after_start: 0s	   → 与主播同时开始
+#		@on voiceover  end_relative: 10.2s → 主播结束后 10.2 秒截断
+#		@on voiceover  fade_out: 1s		   → 截断前最后 1 秒线性渐出至静音
+#	- @loop bgm_a bgm_b → 循环直到被 end_relative 截断
 # ============================================================
 @track bgm
-    volume: 0.3
-    pan: -0.4
-    delay: 0s
+	volume: 0.3
+	pan: -0.4
+	delay: 0s
 
-    @on voiceover
-        after_start: 0s
-    @on voiceover
-        end_relative: 10.2s
-        fade_out: 5s
+	@on voiceover
+		after_start: 0s
+	@on voiceover
+		end_relative: 12.2s
+		fade_out: 5s
 
-    @loop bgm_a bgm_b
+	@loop bgm_a bgm_b
 
-    @segment bgm_a
-        file: sample.wav
-        trim: 0s 4s
-        delay: -0.3s
-        vol: 0s-3s R1.0->0.0 L0.0->1.0
-        vol: 3s-4s R0.0->1.0 L1.0->0.0
+	@segment bgm_a
+		file: sample.wav
+		trim: 0s 4s
+		delay: -0.3s
+		vol: 0s-3s R1.0->0.0 L0.0->1.0
+		vol: 3s-4s R0.0->1.0 L1.0->0.0
 
-    @segment bgm_b
-        file: sample.wav
-        trim: 4s 8s
-        delay: -0.3s
-        vol: 0s-3s R1.0->0.0 L0.0->1.0
-        vol: 3s-4s R0.0->1.0 L1.0->0.0
+	@segment bgm_b
+		file: sample.wav
+		trim: 4s 8s
+		delay: -0.3s
+		vol: 0s-3s R1.0->0.0 L0.0->1.0
+		vol: 3s-4s R0.0->1.0 L1.0->0.0
+
+@track insert
+	volume: 0.5
+
+	@on narration
+		after_start: 0.2s
+
+	@segment bgm_3
+		file: sample.wav
