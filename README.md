@@ -1,17 +1,18 @@
 # KarajanSheet
 
 > - AUTHOR: [LostAbaddon](lostabaddon@gmail.com)
-> - VERSION: 1.2.0
+> - VERSION: 1.3.0
 
 **KarajanSheet** 是一个基于自定义脚本语言的音频编排引擎。使用 **KarajanSheet** 脚本语法声明式地定义多音轨音频的拼接、TTS 合成、音量控制、声道分配与响度归一化，一键生成最终音频。
 
 ## 特性
 
 - **多音轨编排（Track）** — 任意条音轨并行播放，统一应用音量、声道、延迟；多条音轨按时间轴叠加输出
-- **声音预设（@voice）** — 全局定义音色 + 参考文本，TTS 段用 `ref_voice` 一行引用，避免每段重复样板代码
+- **声音预设（@voice）** — 全局定义音色 + 参考文本，TTS 段用 `ref_voice` 一行引用，避免每段重复样板代码；支持 `audio` / `text` / `instruct` / `speed` 四个子字段，零配置合法
 - **声音设计（`instruct:`）** — 用属性标签（`male, young adult, 四川话` 等）描述目标声音，**无需参考音频**即可合成特定音色
-- **语速控制（`speed:`）** — 段级 `speed: 1.4` 加速、`speed: 0.8` 减速
+- **三级语速控制（`speed:`）** — 段 / 轨 / 预设 三个层级都能设置 `speed:`，优先级 `段 > 轨 > 预设 > 1.0`；`@voice.speed` 仅在 `audio` / `instruct` 已设时生效
 - **长文本文件驱动 TTS** — `file: script.md` 自动读取文本内容作为 TTS 源；支持 `.txt` / `.md` / `.markdown` / `.rst` / `.text`
+- **TTS 时间戳 .txt 输出** — 每次生成音频时自动在同路径生成同名 `.txt` 文件，记录每段 TTS 在 master 时间轴上的开始/结束时间（`[hh:mm:ss.SSS]`）与原文；没有 TTS 段时不生成
 - **相对时间控制（@on）** — 一条音轨可以相对另一条音轨/段的开始/结束时间设定自己的开始点与结束点；同一音轨可写多条 @on；**track 优先**解析
 - **循环区间（@loop）** — 音轨内任意闭区间无限循环，可被 @on 的 `end_relative` 强制截断
 - **TTS 集成** — 内置 [OmniVoice](https://github.com/k2-fsa/OmniVoice) 语音合成，支持音色克隆与声音设计；支持 `ref_audio` + `ref_text` 显式声明、`instruct:` 声音设计、或通过 `ref_voice` 引用 @voice 预设
@@ -115,7 +116,7 @@ python solo_tts.py \
 - **@loop** — 音轨内循环区间，再入时第一段的 `delay` 相对上一轮最后一段的结束点
 - **delay** — 段前延迟（替代旧版 `gap`），正=静音，负=与前段重叠
 - **peak_limit** — 全局总线峰值上限（dBFS），防止叠加爆音
-- **TTS 段字段**（**全部可选**，未设置时走 OmniVoice 默认）：`instruct:` 描述声音属性、`speed:` 控制语速、`file:` 指向 `.md` / `.txt` 等纯文本时自动读为 TTS 源
+- **TTS 段字段**（**全部可选**，未设置时走 OmniVoice 默认）：`instruct:` 描述声音属性、`speed:` 控制语速（段 / 轨 / 预设 三级优先级）、`file:` 指向 `.md` / `.txt` 等纯文本时自动读为 TTS 源
 
 ## TTS 引擎
 

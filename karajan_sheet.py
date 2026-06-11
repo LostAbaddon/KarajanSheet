@@ -183,7 +183,9 @@ class Track:
     volume: float = 1.0                     # 整轨音量增益倍数
     pan: float = 0.0                        # -1=全左, 0=居中, 1=全右
     delay: float = 0.0                      # 整轨延迟秒数
+    speed: Optional[float] = None           # 整轨 TTS 语速因子（None=不指定）
     relative_windows: list = field(default_factory=list)  # list[RelativeWindow]
+    pending_ons: list = field(default_factory=list)  # list[tuple[str, int]]: (target_name, lineno)
     loop_start: Optional[str] = None        # 循环起始 segment 名
     loop_end: Optional[str] = None          # 循环结束 segment 名
     segments: list = field(default_factory=list)  # list[Segment]
@@ -194,6 +196,7 @@ class VoiceDef:
     audio: Optional[str] = None
     text: Optional[str] = None
     instruct: Optional[str] = None
+    speed: Optional[float] = None           # 语速因子（仅在 audio/instruct 已设时有效）
 
 @dataclass
 class Script:
@@ -308,6 +311,10 @@ def parse_script(filepath: str) -> Script:
             v = float(tk_delay.group(1))
             u = (tk_delay.group(2) or "s").lower()
             current_track.delay = v if u == "s" else v / 1000.0
+            return True
+        tk_speed = re.match(r"^speed:\s*([\d.]+)$", line, re.IGNORECASE)
+        if tk_speed:
+            current_track.speed = float(tk_speed.group(1))
             return True
         return False
 
@@ -459,9 +466,13 @@ def parse_script(filepath: str) -> Script:
                 if current_track is None:
                     raise SyntaxError(f"第 {lineno} 行: @on 必须出现在 @track 内")
                 _flush_segment()
-                rw = _resolve_on_target(on_match.group(1).strip())
-                current_track.relative_windows.append(rw)
-                current_relative = rw
+                name = on_match.group(1).strip()
+                # 创建占位 RelativeWindow，让紧随其后的 @on 子字段
+                # (after_start/after_end/end_relative/fade_in/fade_out) 能照常写入。
+                # 目标查找延后到所有 @track / @segment 注册完毕之后。
+                stub = RelativeWindow()
+                current_track.pending_ons.append((stub, name, lineno))
+                current_relative = stub
                 continue
 
             # @loop 指令（必须在 track 内）
@@ -524,6 +535,13 @@ def parse_script(filepath: str) -> Script:
             if instruct_match:
                 current_voice.instruct = instruct_match.group(1)
                 continue
+            speed_match = re.match(r"^speed:\s*([\d.]+)$", line, re.IGNORECASE)
+            if speed_match:
+                if current_voice.audio is not None or current_voice.instruct is not None:
+                    current_voice.speed = float(speed_match.group(1))
+                else:
+                    print(f"  [W] 第 {lineno} 行: @voice '{current_voice.name}' speed 仅在有 audio/instruct 时有效，已忽略")
+                continue
             # 退场让后续解析兜底处理
             current_voice = None
 
@@ -549,6 +567,17 @@ def parse_script(filepath: str) -> Script:
             raise SyntaxError(f"第 {lineno} 行: 需要 @segment 或合法的 track 字段，而不是 '{line}'")
 
     _flush_segment()
+
+    # 第二遍：解析所有 @on 引用 —— 此时所有 @track / @segment 都已注册，
+    # 允许 @on 引用文件中位置在前的 track（forward reference）。
+    for t in script.tracks:
+        for stub, name, on_lineno in t.pending_ons:
+            resolved = _resolve_on_target(name)
+            stub.target_kind = resolved.target_kind
+            stub.target_track = resolved.target_track
+            stub.target_segment_ref = resolved.target_segment_ref
+            t.relative_windows.append(stub)
+        t.pending_ons.clear()
 
     if not script.tracks:
         raise ValueError("脚本中没有定义任何 @track")
@@ -796,6 +825,57 @@ def normalize_loudness(data: np.ndarray, base_volume: float) -> np.ndarray:
 # 5. TTS 集成
 # ============================================================
 
+def _resolve_tts_speed(seg: Segment,
+                       track: Optional[Track] = None,
+                       vdef: Optional[VoiceDef] = None) -> float:
+    """按 segment > track > voice > 1.0 的优先级解析最终 TTS 语速。"""
+    if seg.tts_speed is not None:
+        return seg.tts_speed
+    if track is not None and track.speed is not None:
+        return track.speed
+    if vdef is not None and vdef.speed is not None:
+        return vdef.speed
+    return 1.0
+
+
+def _resolve_tts_voice(seg: Segment, track: Optional[Track],
+                       script: Optional[Script]) -> tuple:
+    """解析 TTS 段的最终 voice 配置 + speed。
+
+    字段叠加规则（@voice 预设只覆盖 segment 未显式声明的字段）：
+      - ref_audio: seg.tts_ref_audio ?? vdef.audio
+      - ref_text:  seg.tts_ref_text  ?? vdef.text
+      - instruct:  seg.tts_instruct  ?? vdef.instruct
+      - speed:     seg.tts_speed     ?? track.speed ?? vdef.speed ?? 1.0
+
+    返回 (ref_audio, ref_text, instruct, speed, vdef_or_None)。
+    """
+    ref_audio = seg.tts_ref_audio
+    ref = seg.tts_ref_text
+    instruct = seg.tts_instruct
+
+    vdef = None
+    if seg.tts_ref_voice:
+        if script is None:
+            raise ValueError(
+                f"片段 '{seg.name}': 引用了 @voice 预设但缺少 script 上下文"
+            )
+        if seg.tts_ref_voice not in script.voice_defs:
+            raise ValueError(
+                f"片段 '{seg.name}': 引用了未定义的 @voice 预设 '{seg.tts_ref_voice}'"
+            )
+        vdef = script.voice_defs[seg.tts_ref_voice]
+        if vdef.audio is not None and ref_audio is None:
+            ref_audio = vdef.audio
+        if vdef.text is not None and ref is None:
+            ref = vdef.text
+        if vdef.instruct is not None and instruct is None:
+            instruct = vdef.instruct
+
+    speed = _resolve_tts_speed(seg, track, vdef)
+    return ref_audio, ref, instruct, speed, vdef
+
+
 def generate_tts(text: str, ref_audio_path: Optional[str], ref_text: Optional[str],
                  target_sr: int, base_path: str,
                  instruct: Optional[str] = None,
@@ -869,31 +949,14 @@ def generate_tts(text: str, ref_audio_path: Optional[str], ref_text: Optional[st
 
 def _process_segment_data(seg: Segment, sr: int, base_path: str,
                          base_volume: Optional[float],
-                         script: Optional[Script] = None) -> np.ndarray:
+                         script: Optional[Script] = None,
+                         track: Optional[Track] = None) -> np.ndarray:
     """处理单个 segment，返回音频数据 numpy 数组。"""
     # 加载音频
     if seg.file_path:
         data, _ = load_audio(seg.file_path, sr, base_path)
     elif seg.tts_text:
-        # 显式声明则用之；缺省则交给 OmniVoice 自己处理默认值
-        ref_audio = seg.tts_ref_audio
-        ref = seg.tts_ref_text
-        instruct = seg.tts_instruct
-        speed = seg.tts_speed if seg.tts_speed is not None else 1.0
-        # 如果指定了预设语音，用预设覆盖未显式声明的字段
-        if seg.tts_ref_voice and script is not None:
-            if seg.tts_ref_voice in script.voice_defs:
-                vdef = script.voice_defs[seg.tts_ref_voice]
-                if vdef.audio is not None and ref_audio is None:
-                    ref_audio = vdef.audio
-                if vdef.text is not None and ref is None:
-                    ref = vdef.text
-                if vdef.instruct is not None and instruct is None:
-                    instruct = vdef.instruct
-            else:
-                raise ValueError(
-                    f"片段 '{seg.name}': 引用了未定义的 @voice 预设 '{seg.tts_ref_voice}'"
-                )
+        ref_audio, ref, instruct, speed, _ = _resolve_tts_voice(seg, track, script)
         data = generate_tts(
             seg.tts_text, ref_audio, ref, sr, base_path,
             instruct=instruct, speed=speed,
@@ -948,7 +1011,7 @@ def _render_track(track: Track, sr: int, base_path: str,
         if tts_cache is not None and (track.name, i) in tts_cache:
             _, data = tts_cache[(track.name, i)]
         else:
-            data = _process_segment_data(seg, sr, base_path, base_volume, script)
+            data = _process_segment_data(seg, sr, base_path, base_volume, script, track)
         # 应用 trim / 响度归一化 / vol（缓存中只有原始 TTS 音频，需后处理）
         if seg.trim_start is not None and seg.trim_end is not None:
             data = apply_trim(data, sr, seg.trim_start, seg.trim_end)
@@ -1196,18 +1259,7 @@ def execute_script(script: Script, output_path: str,
         for i, sg in enumerate(t.segments):
             if sg.tts_text is not None and sg.file_path is None:
                 # 实际合成 TTS，获取真实时长
-                ref_audio = sg.tts_ref_audio
-                ref = sg.tts_ref_text
-                instruct = sg.tts_instruct
-                speed = sg.tts_speed if sg.tts_speed is not None else 1.0
-                if sg.tts_ref_voice and sg.tts_ref_voice in script.voice_defs:
-                    vdef = script.voice_defs[sg.tts_ref_voice]
-                    if vdef.audio is not None and ref_audio is None:
-                        ref_audio = vdef.audio
-                    if vdef.text is not None and ref is None:
-                        ref = vdef.text
-                    if vdef.instruct is not None and instruct is None:
-                        instruct = vdef.instruct
+                ref_audio, ref, instruct, speed, _ = _resolve_tts_voice(sg, t, script)
                 data = generate_tts(
                     sg.tts_text, ref_audio, ref, sr, base_path,
                     instruct=instruct, speed=speed,
@@ -1425,6 +1477,116 @@ def execute_script(script: Script, output_path: str,
 
     sf.write(output_path, master, sr)
     print(f"\n✅ 输出完成: {output_path}")
+
+    # ---- 收集 TTS 段时间戳并写入同名 .txt ----
+    tts_segments = _collect_tts_segments(
+        script, track_starts, track_seg_durations, track_force_stops
+    )
+    if tts_segments:
+        _write_tts_timestamps(output_path, tts_segments)
+
+# ============================================================
+# 7. TTS 时间戳输出
+# ============================================================
+
+def _format_timestamp(seconds: float) -> str:
+    """将秒数格式化为 [hh:mm:ss.SSS] 字符串。
+
+    设计要点（你来实现时定）：
+      - 小时不设上限（超长播客可能 > 99 小时）
+      - 分钟/秒固定 2 位
+      - 毫秒固定 3 位
+      - 毫秒部分建议四舍五入到最近毫秒
+      - 进位要正确（59.9995s → 00:01:00.000 而非 00:00:60.000）
+
+    Examples:
+        >>> _format_timestamp(0)
+        '[00:00:00.000]'
+        >>> _format_timestamp(59.999)
+        '[00:00:59.999]'
+        >>> _format_timestamp(59.9995)
+        '[00:01:00.000]'
+        >>> _format_timestamp(3661.5)
+        '[01:01:01.500]'
+    """
+    total_ms = int(round(seconds * 1000))
+    h = total_ms // 3600000
+    m = (total_ms % 3600000) // 60000
+    s = (total_ms % 60000) // 1000
+    ms = total_ms % 1000
+    return f"[{h:02d}:{m:02d}:{s:02d}.{ms:03d}]"
+
+
+def _collect_tts_segments(script: Script,
+                          track_starts: dict,
+                          track_seg_durations: dict,
+                          track_force_stops: dict) -> list:
+    """收集所有 TTS 段在 master 时间轴上的 (start_sec, end_sec, tts_text)。
+
+    复用步骤 C 的 delay 规则：每个段的 local start = prev_end + seg.delay。
+    force_stop 截断段尾部（min(自然 end, track_start + force_stop)），
+    起点已超过 force_stop 的段不出现在输出里——跳过。
+    """
+    segments = []  # list of (start_sec, end_sec, text)
+    for t in script.tracks:
+        track_start = track_starts.get(t.name, 0.0)
+        force_stop = track_force_stops.get(t.name)
+        track_end = (track_start + force_stop) if force_stop is not None else None
+
+        # 模拟 _render_track 的 delay 规则：local start = prev_end + delay
+        prev_end = 0.0
+        for i, sg in enumerate(t.segments):
+            seg_dur = track_seg_durations[t.name][i]
+            seg_delay = sg.delay or 0.0
+            local_start = seg_delay if i == 0 else prev_end + seg_delay
+            if local_start < 0.0:
+                local_start = 0.0
+
+            master_start = track_start + local_start
+            master_end = master_start + seg_dur
+
+            # force_stop 截断
+            if track_end is not None:
+                if master_start >= track_end:
+                    # 段在 force_stop 之后才出现 → 不在输出里
+                    prev_end = local_start + seg_dur
+                    continue
+                if master_end > track_end:
+                    master_end = track_end
+
+            # 只记 TTS 段（tts_text 存在且 file_path 为 None）
+            if sg.tts_text is not None and sg.file_path is None:
+                if master_end < master_start:
+                    master_end = master_start
+                segments.append((master_start, master_end, sg.tts_text))
+
+            prev_end = local_start + seg_dur
+
+    segments.sort(key=lambda x: (x[0], x[1]))
+    return segments
+
+
+def _write_tts_timestamps(output_path: str, tts_segments: list) -> None:
+    """把 TTS 段写入与 output_path 同路径同 basename 的 .txt 文件。
+
+    文件格式（段间空行分隔）：
+        [hh:mm:ss.SSS] - [hh:mm:ss.SSS]
+        文本内容
+
+        [hh:mm:ss.SSS] - [hh:mm:ss.SSS]
+        文本内容
+    """
+    txt_path = os.path.splitext(output_path)[0] + ".txt"
+    lines = []
+    for start, end, text in tts_segments:
+        lines.append(f"{_format_timestamp(start)} - {_format_timestamp(end)}")
+        lines.append(text)
+        lines.append("")  # 段间空行
+    if lines and lines[-1] == "":
+        lines.pop()  # 去掉末尾多余空行
+    with open(txt_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    print(f"  TTS 时间戳已写入: {txt_path}")
 
 def main():
     parser = argparse.ArgumentParser(

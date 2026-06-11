@@ -39,6 +39,9 @@ test_*.py
 
 # Excluded data files
 docs/
-sample.txt
+塔塔.txt
+无恙.txt
 script.md
 template.md
+output.*
+podcast.*

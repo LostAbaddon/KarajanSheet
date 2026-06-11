@@ -4,8 +4,9 @@
 @peak_limit -1.0
 
 @voice host
-	audio: sample.wav
+	audio: 塔塔.wav
 	text: "大家好，这里是胡聊瞎侃嘚啵嘚播客，我是主持人塔塔"
+	speed: 1.5
 
 # ============================================================
 # 音轨 A：主播
@@ -15,24 +16,43 @@
 	pan: 0
 	delay: 0s
 
-	@segment intro
+	@segment intro1
 		tts: "欢迎收听今天的节目"
 		ref_voice: host
 
-	@segment intro
+	@segment intro2
 		tts: "这是一个关于音频脚本引擎的演示"
 		delay: -0.3s
 
-	@segment narration
+	@segment narration1
 		tts: "大家好。Aloha Kosmos!"
 		instruct: "male, child, low pitch"
 		speed: 1.25
 
-	@segment narration
+	@segment narration2
 		tts: "大家好。私が名探偵、工藤タタだ！Aloha Kosmos!"
 #		tts: "大家好。Aloha Kosmos!"
 		instruct: "female, young adult, moderate pitch"
 		speed: 1.25
+
+@track voiceoverA
+	speed: 1.2
+
+	@on voiceover
+		after_start: 0.5s
+
+	@segment introA
+		tts: "欢迎收听怪现象浮世绘"
+		ref_voice: host
+
+@track voiceoverB
+	@on voiceoverA
+		after_start: 0.5s
+
+	@segment introB
+		tts: "欢迎收听误理嘚啵嘚"
+		ref_voice: host
+		speed: 1.0
 
 # ============================================================
 # 音轨 B：背景音乐
@@ -49,23 +69,23 @@
 	pan: -0.4
 	delay: 0s
 
-	@on voiceover
+	@on voiceoverB
 		after_start: 0s
-	@on voiceover
-		end_relative: 12.2s
+	@on voiceoverB
+		end_relative: 0.2s
 		fade_out: 5s
 
 	@loop bgm_a bgm_b
 
 	@segment bgm_a
-		file: sample.wav
+		file: output.wav
 		trim: 0s 4s
 		delay: -0.3s
 		vol: 0s-3s R1.0->0.0 L0.0->1.0
 		vol: 3s-4s R0.0->1.0 L1.0->0.0
 
 	@segment bgm_b
-		file: sample.wav
+		file: output.wav
 		trim: 4s 8s
 		delay: -0.3s
 		vol: 0s-3s R1.0->0.0 L0.0->1.0
@@ -78,4 +98,4 @@
 		after_start: 0.2s
 
 	@segment bgm_3
-		file: sample.wav
+		file: output.wav
