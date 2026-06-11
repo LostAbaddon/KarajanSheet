@@ -35,7 +35,7 @@ ENV/
 *.pkf
 
 # Test files
-test_*.py
+test*.*
 
 # Excluded data files
 docs/

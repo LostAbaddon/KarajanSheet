@@ -94,7 +94,7 @@
 @track insert
 	volume: 0.05
 
-	@on narration
+	@on narration1
 		after_start: 0.2s
 
 	@segment bgm_3

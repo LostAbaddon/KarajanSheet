@@ -55,6 +55,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, Union
 
@@ -879,7 +880,7 @@ def _resolve_tts_voice(seg: Segment, track: Optional[Track],
 def generate_tts(text: str, ref_audio_path: Optional[str], ref_text: Optional[str],
                  target_sr: int, base_path: str,
                  instruct: Optional[str] = None,
-                 speed: float = 1.0) -> np.ndarray:
+                 speed: float = 1.0, num_step: int = 16) -> np.ndarray:
     """
     调用 OmniVoice 模型进行语音合成。
     返回 float32 numpy 数组（单声道）。
@@ -890,7 +891,7 @@ def generate_tts(text: str, ref_audio_path: Optional[str], ref_text: Optional[st
       - 缺省：两者都不给 → 走 OmniVoice 默认音色
     speed 始终传给模型（默认 1.0）。
     """
-    kwargs = {"text": text, "speed": speed}
+    kwargs = {"text": text, "speed": speed, "num_step": num_step}
 
     if ref_text is not None:
         kwargs["ref_text"] = ref_text
@@ -923,7 +924,9 @@ def generate_tts(text: str, ref_audio_path: Optional[str], ref_text: Optional[st
         kwargs["ref_audio"] = input_file
         print(f'  [TTS] 合成（声音克隆）: "{text[:40]}{"..." if len(text) > 40 else ""}"')
 
+    _t0 = time.perf_counter()
     audio = _get_tts_model().generate(**kwargs)
+    _t1 = time.perf_counter()
 
     # audio[0] 是生成的音频 numpy 数组
     data = audio[0]
@@ -940,7 +943,7 @@ def generate_tts(text: str, ref_audio_path: Optional[str], ref_text: Optional[st
             data
         )
 
-    print(f"  [TTS] 生成完成，{len(data) / target_sr:.1f} 秒")
+    print(f"  [TTS] 生成用时，{_t1 - _t0:.2f} 秒")
     return data
 
 # ============================================================
@@ -1007,17 +1010,17 @@ def _render_track(track: Track, sr: int, base_path: str,
     seg_datas = []
     seg_durations = []
     for i, seg in enumerate(track.segments):
-        # 优先使用 TTS 缓存（避免重复合成）
+        # 优先使用 TTS 缓存（已在 Step A 完成合成 + trim/normalize/vol 后处理）
         if tts_cache is not None and (track.name, i) in tts_cache:
             _, data = tts_cache[(track.name, i)]
         else:
             data = _process_segment_data(seg, sr, base_path, base_volume, script, track)
-        # 应用 trim / 响度归一化 / vol（缓存中只有原始 TTS 音频，需后处理）
-        if seg.trim_start is not None and seg.trim_end is not None:
+        # 仅对非缓存段做后处理（TTS 缓存数据已在 Step A 完成）
+        if (tts_cache is None or (track.name, i) not in tts_cache) and seg.trim_start is not None and seg.trim_end is not None:
             data = apply_trim(data, sr, seg.trim_start, seg.trim_end)
-        if base_volume is not None:
+        if (tts_cache is None or (track.name, i) not in tts_cache) and base_volume is not None:
             data = normalize_loudness(data, base_volume)
-        if seg.vol_commands:
+        if (tts_cache is None or (track.name, i) not in tts_cache) and seg.vol_commands:
             data = apply_volume_commands(data, sr, seg.vol_commands)
         seg_datas.append(data)
         seg_durations.append(len(data) / sr)
@@ -1091,9 +1094,11 @@ def _render_track(track: Track, sr: int, base_path: str,
     n_channels = 2 if is_stereo else 1
 
     if n_channels == 1:
-        track_out = np.zeros(total_frames, dtype=np.float32)
+        track_out = np.empty(total_frames, dtype=np.float32)
+        track_out.fill(0.0)
     else:
-        track_out = np.zeros((total_frames, n_channels), dtype=np.float32)
+        track_out = np.empty((total_frames, n_channels), dtype=np.float32)
+        track_out.fill(0.0)
 
     for data, start in intervals:
         end = start + len(data)
@@ -1160,8 +1165,9 @@ def _render_track(track: Track, sr: int, base_path: str,
     return track_out
 
 def execute_script(script: Script, output_path: str,
-                   cli_base_path: Optional[str] = None) -> None:
+                   cli_base_path: Optional[str] = None, num_step: int = 16) -> None:
     """执行脚本，生成最终音频文件。"""
+    _script_t0 = time.perf_counter()
     sr = script.sample_rate
 
     base_path = cli_base_path if cli_base_path else script.base_path
@@ -1209,23 +1215,31 @@ def execute_script(script: Script, output_path: str,
     #   步骤 E：声音合成与装配（实际加载/合成 → 混音 → 写文件）
     # ============================================================
 
-    # 工具：从文件头读时长（不加载整个文件）
+    # 探测时长缓存：避免同一 file 路径被 sf.info / ffprobe 多次调用
+    _probe_cache: dict = {}
+
     def _probe_file_seconds(path: str) -> float:
         if not os.path.isabs(path):
-            path = os.path.join(base_path, path)
+            abs_path = os.path.join(base_path, path)
+        else:
+            abs_path = path
+        if abs_path in _probe_cache:
+            return _probe_cache[abs_path]
         try:
-            info = sf.info(path)
-            return float(info.frames) / float(info.samplerate)
+            info = sf.info(abs_path)
+            result = float(info.frames) / float(info.samplerate)
         except Exception:
             try:
                 r = subprocess.run(
                     ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-                     "-of", "default=noprint_wrappers=1:nokey=1", path],
+                     "-of", "default=noprint_wrappers=1:nokey=1", abs_path],
                     capture_output=True, text=True
                 )
-                return float(r.stdout.strip())
+                result = float(r.stdout.strip())
             except Exception:
-                return 5.0  # 兜底
+                result = 5.0  # 兜底
+        _probe_cache[abs_path] = result
+        return result
 
     # TTS 时长估算系数（中文/英文混合保守值）
     TTS_CHARS_PER_SEC = 4.0
@@ -1250,24 +1264,22 @@ def execute_script(script: Script, output_path: str,
 
     # ---- 步骤 A：探测固定时长 ----
     # 对 file 段用 ffprobe 读真实时长；对 TTS 段**实际合成**获取真实时长
-    print("=== 步骤 A：探测固定时长 + TTS 实际合成（获取真实时长）===")
+    print("=== 步骤 A：探测固定时长 + TTS 并发合成（获取真实时长）===")
     track_seg_durations = {}  # track_name -> [seg_durations]
-    tts_cache = {}            # (track_name, seg_idx) -> (duration, audio_data)
+    tts_cache = {}            # (track_name, seg_idx) -> (duration, processed_audio_data)
+
+    # ---- 阶段 1：收集所有段的元数据和 TTS 任务 ----
+    # 对 file 段：sf.info 拿时长（缓存），不加载波形
+    # 对 TTS 段：收集合成参数，统一交并发池执行
+    tts_tasks = []  # list of (track_name, seg_idx, text, ref_audio, ref_text, instruct, speed, seg)
 
     for t in script.tracks:
         durs = []
         for i, sg in enumerate(t.segments):
             if sg.tts_text is not None and sg.file_path is None:
-                # 实际合成 TTS，获取真实时长
                 ref_audio, ref, instruct, speed, _ = _resolve_tts_voice(sg, t, script)
-                data = generate_tts(
-                    sg.tts_text, ref_audio, ref, sr, base_path,
-                    instruct=instruct, speed=speed,
-                )
-                seg_dur = len(data) / sr
-                durs.append(seg_dur)
-                tts_cache[(t.name, i)] = (seg_dur, data)
-                print(f"  [A] {t.name}/{sg.name} (TTS实际) = {seg_dur:.2f}s")
+                tts_tasks.append((t.name, i, sg.tts_text, ref_audio, ref, instruct, speed, sg))
+                durs.append(None)  # 占位，真实时长在阶段 2 填充
             else:
                 d = _seg_estimate_seconds(sg)
                 durs.append(d)
@@ -1275,7 +1287,37 @@ def execute_script(script: Script, output_path: str,
                 print(f"  [A] {t.name}/{sg.name} ({tag}) ≈ {d:.2f}s")
         track_seg_durations[t.name] = durs
 
-    # ---- 步骤 B：计算固定时间点（@on 起始约束） ----
+    # ---- 阶段 2：并发 TTS 合成 + 即时后处理 ----
+    if tts_tasks:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def _do_tts(task):
+            tname, sidx, text, ref_a, ref_t, inst, spd, seg = task
+            data = generate_tts(
+                text, ref_a, ref_t, sr, base_path,
+                instruct=inst, speed=spd, num_step=num_step,
+            )
+            # 后处理：trim → normalize → vol（一次顺序加工）
+            if seg.trim_start is not None and seg.trim_end is not None:
+                data = apply_trim(data, sr, seg.trim_start, seg.trim_end)
+            if script.base_volume is not None:
+                data = normalize_loudness(data, script.base_volume)
+            if seg.vol_commands:
+                data = apply_volume_commands(data, sr, seg.vol_commands)
+            seg_dur = len(data) / sr
+            return (tname, sidx, seg_dur, data)
+
+        # MPS 后端 PyTorch 在多线程中实际串行执行，但线程模型释放了主线程 + 减少 tokenization 等待
+        # CUDA / CPU 后端会真受益
+        max_w = int(os.environ.get("OMNIVOICE_TTS_WORKERS", "2"))
+        with ThreadPoolExecutor(max_workers=max_w) as pool:
+            futures = {pool.submit(_do_tts, t): t for t in tts_tasks}
+            for fut in as_completed(futures):
+                tname, sidx, seg_dur, data = fut.result()
+                track_seg_durations[tname][sidx] = seg_dur
+                tts_cache[(tname, sidx)] = (seg_dur, data)
+                sg = futures[fut][7]
+                print(f"  [A] {tname}/{sg.name} (TTS实际, {num_step}步) = {seg_dur:.2f}s")
     print("=== 步骤 B：计算固定时间点（@on 起始约束） ===")
     track_starts = {}    # track_name -> master 起点 (秒)
     track_durations = {} # track_name -> 估算时长（会被 force_stop 收敛）
@@ -1442,10 +1484,11 @@ def execute_script(script: Script, output_path: str,
             max_channels = max(max_channels, data.shape[1])
 
     if max_channels > 1:
-        master = np.zeros((max_end_frame, max_channels), dtype=np.float32)
+        master = np.empty((max_end_frame, max_channels), dtype=np.float32)
+        master.fill(0.0)
     else:
-        master = np.zeros(max_end_frame, dtype=np.float32)
-
+        master = np.empty(max_end_frame, dtype=np.float32)
+        master.fill(0.0)
     for tname in sorted_order:
         data = rendered[tname]
         start = track_positions[tname]
@@ -1474,6 +1517,7 @@ def execute_script(script: Script, output_path: str,
 
     total_duration = len(master) / sr
     print(f"总时长: {total_duration:.2f} 秒")
+    print(f"总用时: {time.perf_counter() - _script_t0:.2f} 秒")
 
     sf.write(output_path, master, sr)
     print(f"\n✅ 输出完成: {output_path}")
@@ -1604,13 +1648,17 @@ def main():
         "--base-path", "-b", type=str, default=None,
         help="覆盖脚本中的 @base_path 设置"
     )
+    parser.add_argument(
+        "--step", type=int, default=16,
+        help="TTS diffusion 步数（默认 16，设为 32 可获更高质量）"
+    )
     args = parser.parse_args()
 
     # 解析脚本
     script = parse_script(args.script)
 
     # 执行
-    execute_script(script, args.output, args.base_path)
+    execute_script(script, args.output, args.base_path, num_step=args.step)
 
 if __name__ == "__main__":
     main()
