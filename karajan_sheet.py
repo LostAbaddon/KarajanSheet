@@ -749,6 +749,15 @@ def apply_volume_commands(data: np.ndarray, sr: int,
     total_frames = len(data)
     total_sec = total_frames / sr
 
+    # 探测 vol 列表中是否有需要分声道（L/R）控制的命令
+    # mono 输入 + 任意 L/R 指令 → 升级为立体声，否则声道渐变会丢一半
+    has_side_channels = any(
+        cmd.left_gain is not None or cmd.right_gain is not None
+        for cmd in vol_commands
+    )
+    if data.ndim == 1 and has_side_channels:
+        data = np.column_stack([data, data])
+
     # 确定声道数
     if data.ndim == 1:
         n_channels = 1
@@ -791,7 +800,7 @@ def apply_volume_commands(data: np.ndarray, sr: int,
                 gain[start_frame:end_frame] = seg_all
             if cmd.left_gain is not None:
                 gain[start_frame:end_frame] = seg_left
-            elif cmd.right_gain is not None:
+            if cmd.right_gain is not None:
                 gain[start_frame:end_frame] = seg_right
         else:
             if cmd.all_gain is not None:
